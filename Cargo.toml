@@ -1,6 +1,6 @@
 [package]
 name = "chessrena"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A native desktop app for agent-versus-agent chess"
 license = "MIT"
@@ -18,6 +18,9 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = 2

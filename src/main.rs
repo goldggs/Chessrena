@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod api;
 mod tunnel;
 
@@ -11,6 +13,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -719,6 +722,7 @@ struct ChessrenaApp {
     tunnel: tunnel::TunnelController,
     last_tunnel_url: Option<String>,
     tunnel_url_changed: bool,
+    logo: Option<egui::TextureHandle>,
 }
 
 impl ChessrenaApp {
@@ -739,6 +743,7 @@ impl ChessrenaApp {
             tunnel: tunnel::TunnelController::start(),
             last_tunnel_url: None,
             tunnel_url_changed: false,
+            logo: None,
         })
     }
 
@@ -782,10 +787,7 @@ impl ChessrenaApp {
                             (true, true) => egui::Color32::from_rgb(246, 246, 105),
                             (false, true) => egui::Color32::from_rgb(186, 202, 43),
                         };
-                        let piece = board
-                            .piece_on(square)
-                            .map(|p| piece_glyph(p, board.color_on(square).unwrap_or(Color::White)))
-                            .unwrap_or(' ');
+                        let piece = board.piece_on(square).map(piece_glyph).unwrap_or(' ');
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(square_size, square_size),
                             egui::Sense::hover(),
@@ -797,11 +799,31 @@ impl ChessrenaApp {
                             } else {
                                 egui::Color32::from_rgb(31, 39, 33)
                             };
+                            let font = egui::FontId::proportional(square_size * 0.78);
+                            let outline = egui::Color32::from_rgb(30, 38, 31);
+                            for offset in [
+                                egui::vec2(-1.2, 0.0),
+                                egui::vec2(1.2, 0.0),
+                                egui::vec2(0.0, -1.2),
+                                egui::vec2(0.0, 1.2),
+                                egui::vec2(-0.8, -0.8),
+                                egui::vec2(0.8, -0.8),
+                                egui::vec2(-0.8, 0.8),
+                                egui::vec2(0.8, 0.8),
+                            ] {
+                                ui.painter().text(
+                                    rect.center() + offset,
+                                    egui::Align2::CENTER_CENTER,
+                                    piece,
+                                    font.clone(),
+                                    outline,
+                                );
+                            }
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 piece,
-                                egui::FontId::proportional(square_size * 0.78),
+                                font,
                                 ink,
                             );
                         }
@@ -860,6 +882,12 @@ impl eframe::App for ChessrenaApp {
         style.visuals.selection.stroke.color = egui::Color32::from_rgb(23, 34, 26);
         ctx.set_style(style);
 
+        if self.logo.is_none() {
+            let pixels = include_bytes!("../assets/chessrena-square.rgba");
+            let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], pixels);
+            self.logo = Some(ctx.load_texture("chessrena-square-logo", image, Default::default()));
+        }
+
         egui::TopBottomPanel::top("topbar")
             .frame(
                 egui::Frame::NONE
@@ -868,15 +896,10 @@ impl eframe::App for ChessrenaApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("C").color(accent).strong().size(18.0));
+                    if let Some(logo) = &self.logo {
+                        ui.image((logo.id(), egui::vec2(28.0, 28.0)));
+                    }
                     ui.label(egui::RichText::new("Chessrena").strong().size(16.0));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new("Local app")
-                                .color(egui::Color32::GRAY)
-                                .small(),
-                        );
-                    });
                 });
             });
 
@@ -976,106 +999,100 @@ impl ChessrenaApp {
         ui.add_space(9.0);
         match self.store.list() {
             Ok(matches) if matches.is_empty() => {
-                egui::Frame::group(ui.style())
-                    .fill(surface)
-                    .stroke(egui::Stroke::new(1.0_f32, border))
-                    .show(ui, |ui| {
-                        ui.set_min_height(110.0);
-                        ui.centered_and_justified(|ui| {
-                            ui.label("No matches yet. Create a match to get started.");
-                        });
-                    });
+                ui.add_space(100.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 180.0),
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| ui.label("No matches yet. Create a match to get started."),
+                );
             }
             Ok(matches) => {
-                let count = matches.len();
-                egui::Grid::new("match_cards")
-                    .num_columns(2)
-                    .spacing(egui::vec2(12.0, 12.0))
-                    .show(ui, |ui| {
-                        for (index, m) in matches.into_iter().enumerate() {
-                            egui::Frame::group(ui.style())
-                                .fill(surface)
-                                .stroke(egui::Stroke::new(1.0_f32, border))
-                                .inner_margin(12.0)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(390.0);
-                                    ui.horizontal(|ui| {
-                                        Self::show_board(ui, &m.fen, &m.moves, 90.0, false);
-                                        ui.add_space(10.0);
-                                        ui.vertical(|ui| {
-                                            ui.horizontal(|ui| {
-                                                if ui
-                                                    .selectable_label(
-                                                        false,
-                                                        egui::RichText::new(&m.name).strong(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.open_saved_match(m.id);
-                                                }
-                                                ui.menu_button("⋯", |ui| {
-                                                    if m.status != "Finished"
-                                                        && ui
-                                                            .button("End match (no result)")
-                                                            .clicked()
-                                                    {
-                                                        self.end_target = Some(m.id);
-                                                        ui.close_menu();
-                                                    }
-                                                    if ui.button("Rename").clicked() {
-                                                        self.rename_target =
-                                                            Some((m.id, m.name.clone()));
-                                                        ui.close_menu();
-                                                    }
-                                                    if ui.button("Delete match").clicked() {
-                                                        self.delete_target = Some(m.id);
-                                                        ui.close_menu();
-                                                    }
-                                                });
-                                            });
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "White {}   Black {}",
-                                                    m.white_name, m.black_name
-                                                ))
-                                                .color(egui::Color32::GRAY)
-                                                .small(),
-                                            );
-                                            ui.add_space(8.0);
-                                            let status_color = if m.status == "Finished" {
-                                                egui::Color32::GRAY
-                                            } else {
-                                                accent
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "● {}   {}",
-                                                    m.status,
-                                                    last_move(&m.moves)
-                                                ))
-                                                .color(status_color)
-                                                .small(),
-                                            );
+                let widget_style = ui.style().clone();
+                ui.columns(2, |columns| {
+                    for (index, m) in matches.into_iter().enumerate() {
+                        let column = &mut columns[index % 2];
+                        let column_width = column.available_width();
+                        let board_size = (column_width * 0.34).clamp(132.0, 176.0);
+                        let content_width = (column_width - 28.0).max(280.0);
+                        egui::Frame::group(&widget_style)
+                            .fill(surface)
+                            .stroke(egui::Stroke::new(1.0_f32, border))
+                            .inner_margin(12.0)
+                            .show(column, |ui| {
+                                ui.set_min_width(content_width);
+                                ui.set_min_height(board_size + 4.0);
+                                ui.horizontal(|ui| {
+                                    Self::show_board(ui, &m.fen, &m.moves, board_size, false);
+                                    ui.add_space(12.0);
+                                    ui.vertical(|ui| {
+                                        ui.set_min_width(
+                                            (content_width - board_size - 12.0).max(120.0),
+                                        );
+                                        ui.horizontal(|ui| {
                                             if ui
-                                                .add(
-                                                    egui::Button::new("Open match")
-                                                        .stroke(egui::Stroke::new(1.0_f32, border)),
+                                                .selectable_label(
+                                                    false,
+                                                    egui::RichText::new(&m.name).strong(),
                                                 )
                                                 .clicked()
                                             {
                                                 self.open_saved_match(m.id);
                                             }
+                                            ui.menu_button("More", |ui| {
+                                                if m.status != "Finished"
+                                                    && ui.button("End match (no result)").clicked()
+                                                {
+                                                    self.end_target = Some(m.id);
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Rename").clicked() {
+                                                    self.rename_target =
+                                                        Some((m.id, m.name.clone()));
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Delete match").clicked() {
+                                                    self.delete_target = Some(m.id);
+                                                    ui.close_menu();
+                                                }
+                                            });
                                         });
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "White {} | Black {}",
+                                                m.white_name, m.black_name
+                                            ))
+                                            .color(egui::Color32::GRAY)
+                                            .small(),
+                                        );
+                                        ui.add_space(5.0);
+                                        let status_color = if m.status == "Finished" {
+                                            egui::Color32::GRAY
+                                        } else {
+                                            accent
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} | {}",
+                                                m.status,
+                                                last_move(&m.moves)
+                                            ))
+                                            .color(status_color)
+                                            .small(),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Button::new("Open match")
+                                                    .stroke(egui::Stroke::new(1.0_f32, border)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.open_saved_match(m.id);
+                                        }
                                     });
                                 });
-                            if index % 2 == 1 {
-                                ui.end_row();
-                            }
-                        }
-                        if count % 2 == 1 {
-                            ui.end_row();
-                        }
-                    });
+                            });
+                    }
+                });
             }
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1109,7 +1126,7 @@ impl ChessrenaApp {
         let chat_messages = self.store.chat_messages(id).unwrap_or_default();
         let tunnel_status = self.tunnel.status();
         ui.horizontal(|ui| {
-            if ui.button("‹  Matches").clicked() {
+            if ui.button("Back to matches").clicked() {
                 if let Err(e) = self.store.close_match(id) {
                     self.error = Some(e.to_string());
                 }
@@ -1119,7 +1136,7 @@ impl ChessrenaApp {
             ui.add_space(8.0);
             ui.heading(&record.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("⋯", |ui| {
+                ui.menu_button("More", |ui| {
                     if record.status != "Finished" && ui.button("End match (no result)").clicked() {
                         self.end_target = Some(id);
                         ui.close_menu();
@@ -1434,7 +1451,9 @@ impl ChessrenaApp {
 }
 
 fn agent_prompt(match_id: i64, seat: u8, token: &str, server_url: &str) -> String {
-    format!("You are one of two agents playing a Chessrena match. Use the official Python helper at https://github.com/goldggs/Chessrena/blob/main/agent/chessrena_agent.py. Save it in your persistent workspace and inspect the source before running it.\n\nFirst-time setup: register with:\npython3 chessrena_agent.py register --url {server_url} --match {match_id} --invite {token} --name YOUR_NAME\n\nIf you already have a saved config, update its endpoint without changing your invite token:\npython3 chessrena_agent.py set-url --match {match_id} --url {server_url}\n\nMark ready, then keep polling:\npython3 chessrena_agent.py ready --match {match_id}\npython3 chessrena_agent.py wait --match {match_id}\n\nChat is available only when both agents are ready and the match is open. Send a message with `chat --match {match_id} --text \"...\"`. If nextAction is acknowledge, run `ack --match {match_id}` or `ack --match {match_id} --reply \"...\"`. A reply becomes the next message awaiting acknowledgment. Never move while you have a pending message; the server enforces this.\n\nSubmit only a listed legal move when nextAction is move: `move --match {match_id} UCI_MOVE`. You may resign a started match, including while paused, with `resign --match {match_id}`. The URL is temporary; if it changes, rerun set-url. You are Agent {seat}.")
+    format!(
+        "You are one of two AIs playing a Chessrena match. Use the official Python helper at https://github.com/goldggs/Chessrena/blob/main/agent/chessrena_agent.py. Save it in your persistent workspace and inspect the source before running it.\n\nFirst-time setup: register with:\n\npython3 chessrena_agent.py register --url {server_url} --match {match_id} --invite {token} --name YOUR_NAME\n\nIf you already have a saved config, update its endpoint without changing your invite token:\n\npython3 chessrena_agent.py set-url --match {match_id} --url {server_url}\n\nMark ready, then keep polling:\n\npython3 chessrena_agent.py ready --match {match_id}\n\npython3 chessrena_agent.py wait --match {match_id}\n\nChat is available only when both agents are ready and the match is open. Send a message with chat --match {match_id} --text \"...\". If nextAction is acknowledge, run ack --match {match_id} or ack --match {match_id} --reply \"...\". A reply becomes the next message awaiting acknowledgment. Never move while you have a pending message; the server enforces this.\n\nSubmit only a listed legal move when nextAction is move: move --match {match_id} UCI_MOVE. You may resign a started match, including while paused, with resign --match {match_id}. The URL is temporary; if it changes, rerun set-url. You are the {seat} AI."
+    )
 }
 
 fn result_summary(record: &MatchRecord) -> String {
@@ -1448,7 +1467,7 @@ fn result_summary(record: &MatchRecord) -> String {
         Some("resignation") => format!("{} wins by resignation", winner.unwrap_or("Opponent")),
         Some("stalemate") => "Draw by stalemate".to_owned(),
         Some("draw") => "Draw".to_owned(),
-        Some("ended_without_result") => "Match ended — no result".to_owned(),
+        Some("ended_without_result") => "Match ended - no result".to_owned(),
         _ => "Match finished".to_owned(),
     }
 }
@@ -1518,20 +1537,16 @@ fn last_move(moves: &str) -> String {
         .and_then(|game| game.history().last().map(|played| played.san.clone()))
         .unwrap_or_else(|| "No moves".to_owned())
 }
-fn piece_glyph(piece: Piece, color: Color) -> char {
-    match (color, piece) {
-        (Color::White, Piece::King) => '♔',
-        (Color::White, Piece::Queen) => '♕',
-        (Color::White, Piece::Rook) => '♖',
-        (Color::White, Piece::Bishop) => '♗',
-        (Color::White, Piece::Knight) => '♘',
-        (Color::White, Piece::Pawn) => '♙',
-        (Color::Black, Piece::King) => '♚',
-        (Color::Black, Piece::Queen) => '♛',
-        (Color::Black, Piece::Rook) => '♜',
-        (Color::Black, Piece::Bishop) => '♝',
-        (Color::Black, Piece::Knight) => '♞',
-        (Color::Black, Piece::Pawn) => '♟',
+fn piece_glyph(piece: Piece) -> char {
+    // Use the filled chess glyphs for both sides, then tint white-side pieces
+    // with a light fill and a subtle dark outline so they remain legible on cream.
+    match piece {
+        Piece::King => '♚',
+        Piece::Queen => '♛',
+        Piece::Rook => '♜',
+        Piece::Bishop => '♝',
+        Piece::Knight => '♞',
+        Piece::Pawn => '♟',
     }
 }
 
@@ -1539,6 +1554,11 @@ fn main() -> eframe::Result<()> {
     let app = ChessrenaApp::new().unwrap_or_else(|message| panic!("{message}"));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(Arc::new(egui::IconData {
+                rgba: include_bytes!("../assets/chessrena-square.rgba").to_vec(),
+                width: 128,
+                height: 128,
+            }))
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([760.0, 560.0]),
         ..Default::default()
@@ -1852,6 +1872,21 @@ mod tests {
             store.seat_for_token(created.id, &new_token).unwrap().seat,
             1
         );
+    }
+
+    #[test]
+    fn copied_agent_prompt_uses_the_tuned_ai_wording_and_seat() {
+        let prompt = agent_prompt(12, 2, "private-token", "https://example.trycloudflare.com");
+        assert!(prompt.starts_with("You are one of two AIs playing a Chessrena match."));
+        assert!(prompt.contains("--invite private-token"));
+        assert!(prompt.contains("You are the 2 AI."));
+        assert!(!prompt.contains("[agent.py]"));
+    }
+
+    #[test]
+    fn filled_chess_glyphs_are_used_for_both_piece_colors() {
+        assert_eq!(piece_glyph(Piece::Pawn), '♟');
+        assert_eq!(piece_glyph(Piece::King), '♚');
     }
 
     #[test]

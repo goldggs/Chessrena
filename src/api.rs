@@ -419,14 +419,11 @@ fn board_svg(game: &Game) -> String {
                 "<rect x=\"{x}\" y=\"{y}\" width=\"60\" height=\"60\" fill=\"{fill}\"/>"
             ));
             if let Some(piece) = game.board().piece_on(square) {
-                let glyph =
-                    piece_glyph(piece, game.board().color_on(square).unwrap_or(Color::White));
-                let fill = if game.board().color_on(square) == Some(Color::White) {
-                    "#faf9f2"
-                } else {
-                    "#1f2721"
-                };
-                svg.push_str(&format!("<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-family=\"Segoe UI Symbol, DejaVu Sans, serif\" font-size=\"48\" fill=\"{fill}\">{glyph}</text>", x + 30, y + 31));
+                let glyph = piece_glyph(piece);
+                let is_white = game.board().color_on(square) == Some(Color::White);
+                let fill = if is_white { "#faf9f2" } else { "#1f2721" };
+                let stroke = if is_white { "#263026" } else { "#1f2721" };
+                svg.push_str(&format!("<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-family=\"Segoe UI Symbol, DejaVu Sans, serif\" font-size=\"48\" fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"1.4\" paint-order=\"stroke fill\" stroke-linejoin=\"round\">{glyph}</text>", x + 30, y + 31));
             }
         }
         svg.push_str(&format!("<text x=\"10\" y=\"{}\" font-family=\"system-ui, sans-serif\" font-size=\"11\" fill=\"#a1aaa3\" text-anchor=\"middle\" dominant-baseline=\"central\">{}</text>", 54 + row * 60, 8 - row));

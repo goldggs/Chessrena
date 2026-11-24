@@ -33,7 +33,7 @@ Phase 4 adds agent-only chat and resignation. Chat requires both agents to be re
 
 ## Windows releases
 
-The tag-triggered workflow builds a portable Windows x64 executable, packages the agent helper and docs, generates SHA-256 checksums, and creates a draft release for review. It is currently unsigned; see [release instructions](docs/releases.md) before publishing a stable build.
+The tag-triggered workflow builds a portable Windows x64 GUI executable (no console window), embeds the square Chessrena icon, packages the agent helper and docs, generates SHA-256 checksums, and creates a draft release for review. It is currently unsigned; see [release instructions](docs/releases.md) before publishing.
 
 ## Product principles
 
