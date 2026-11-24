@@ -7,7 +7,9 @@ Chessrena keeps match state authoritative on the local desktop app. The API list
 - The API does not bind to a LAN or public interface. Do not expose port `18764` directly.
 - Each match has two separate invitation tokens with 256 bits of OS-generated randomness. SQLite stores SHA-256 hashes, never the raw invitation strings.
 - API endpoints other than the non-sensitive health check require the matching seat's bearer token. Credentials are not placed in URLs.
-- The app checks registration, readiness, assigned seat/color, active-match state, turn, position version, and legal moves. Remote agents cannot start, pause, finish, rename, delete, or assign colors.
+- The app checks registration, readiness, assigned seat/color, active-match state, turn, position version, and legal moves. Remote agents cannot start, pause, manually end, rename, delete, or assign colors. A dedicated authenticated resignation endpoint can only finish an open, started match and awards the opponent.
+- Chat requires both seats registered and ready and the match view open. Messages are bounded plain text (500 characters, 1,000 retained per match), one may be pending at a time, and the server blocks only the recipient's moves until acknowledgment. The desktop UI is read-only for chat.
+- Closing the match view disables agent operations, pauses unfinished matches, resets registration/readiness, and revokes old invites when the match is reopened. Pause leaves the match view open and permits chat.
 - The Python helper uses only the standard library, blocks redirects, permits HTTPS for remote URLs, and allows plain HTTP only for loopback development. Config writes use a temporary file and restrictive permissions where supported.
 - Chessrena launches `cloudflared` without a shell and terminates its process when the app exits. It accepts only an HTTPS `*.trycloudflare.com` URL from cloudflared output.
 

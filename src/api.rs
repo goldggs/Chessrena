@@ -1,4 +1,4 @@
-use crate::{piece_glyph, AgentSeat, Store};
+use crate::{piece_glyph, AgentSeat, ChatMessage, Store};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -31,6 +31,17 @@ struct RegisterRequest {
 struct MoveRequest {
     uci: String,
     position_version: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatRequest {
+    text: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AcknowledgeRequest {
+    message_id: i64,
+    reply: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -72,8 +83,24 @@ fn with_store<T>(
         } else if message.contains("Invalid") || message.contains("token") {
             StatusCode::UNAUTHORIZED
         } else if [
-            "cannot", "must", "already", "legal", "turn", "waiting", "active", "ready", "position",
-            "color", "register",
+            "cannot",
+            "must",
+            "already",
+            "legal",
+            "turn",
+            "waiting",
+            "active",
+            "ready",
+            "position",
+            "color",
+            "register",
+            "chat",
+            "acknowledge",
+            "closed",
+            "resign",
+            "started",
+            "message",
+            "ended",
         ]
         .iter()
         .any(|marker| message.to_lowercase().contains(marker))
@@ -137,12 +164,7 @@ async fn get_agent_state(
     let token = bearer_token(&headers)?;
     let result = with_store(&state, |store| {
         let seat = store.seat_for_token(match_id, token)?;
-        let record = store
-            .get(match_id)
-            .map_err(|e| e.to_string())?
-            .ok_or("Match not found")?;
-        let game = Game::from_uci_history(&record.moves).map_err(|e| e.to_string())?;
-        Ok(state_json(match_id, &record, &seat, &game))
+        current_state(store, match_id, &seat)
     })?;
     Ok(Json(result))
 }
@@ -161,6 +183,9 @@ async fn submit_move(
             .map_err(|e| e.to_string())?
             .ok_or("Match not found")?;
         let game = Game::from_uci_history(&record.moves).map_err(|e| e.to_string())?;
+        if store.has_pending_chat_for_seat(match_id, seat.seat)? {
+            return Err("Acknowledge the pending chat message before moving".to_owned());
+        }
         if request.position_version != game.history().len() {
             return Err(
                 "Position version is stale. Fetch the current state before moving".to_owned(),
@@ -175,18 +200,80 @@ async fn submit_move(
             return Err("It is not this agent's turn in an active match".to_owned());
         }
         let played = store.play_uci(match_id, &request.uci)?;
-        let updated = store
-            .get(match_id)
-            .map_err(|e| e.to_string())?
-            .ok_or("Match not found")?;
-        let updated_game = Game::from_uci_history(&updated.moves).map_err(|e| e.to_string())?;
         Ok(json!({
             "accepted": true,
             "move": {"uci": played.uci, "san": played.san},
-            "state": state_json(match_id, &updated, &seat, &updated_game)
+            "state": current_state(store, match_id, &seat)?
         }))
     })?;
     Ok(Json(result))
+}
+
+async fn send_chat(
+    State(state): State<ApiState>,
+    Path(match_id): Path<i64>,
+    headers: HeaderMap,
+    Json(request): Json<ChatRequest>,
+) -> ApiResponse {
+    let token = bearer_token(&headers)?;
+    let result = with_store(&state, |store| {
+        store.send_chat(match_id, token, &request.text)?;
+        let seat = store.seat_for_token(match_id, token)?;
+        current_state(store, match_id, &seat)
+    })?;
+    Ok(Json(json!({"accepted": true, "state": result})))
+}
+
+async fn acknowledge_chat(
+    State(state): State<ApiState>,
+    Path(match_id): Path<i64>,
+    headers: HeaderMap,
+    Json(request): Json<AcknowledgeRequest>,
+) -> ApiResponse {
+    let token = bearer_token(&headers)?;
+    let result = with_store(&state, |store| {
+        store.acknowledge_chat(
+            match_id,
+            token,
+            request.message_id,
+            request.reply.as_deref(),
+        )?;
+        let seat = store.seat_for_token(match_id, token)?;
+        current_state(store, match_id, &seat)
+    })?;
+    Ok(Json(json!({"accepted": true, "state": result})))
+}
+
+async fn resign(
+    State(state): State<ApiState>,
+    Path(match_id): Path<i64>,
+    headers: HeaderMap,
+) -> ApiResponse {
+    let token = bearer_token(&headers)?;
+    let result = with_store(&state, |store| {
+        store.resign(match_id, token)?;
+        let seat = store.seat_for_token(match_id, token)?;
+        current_state(store, match_id, &seat)
+    })?;
+    Ok(Json(json!({"accepted": true, "state": result})))
+}
+
+fn current_state(store: &Store, match_id: i64, seat: &AgentSeat) -> Result<Value, String> {
+    let record = store
+        .get(match_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("Match not found")?;
+    let game = Game::from_uci_history(&record.moves).map_err(|e| e.to_string())?;
+    let chat_enabled = store.chat_enabled(match_id)?;
+    let messages = store.chat_messages(match_id).map_err(|e| e.to_string())?;
+    Ok(state_json(
+        match_id,
+        &record,
+        seat,
+        &game,
+        chat_enabled,
+        &messages,
+    ))
 }
 
 fn color_name(color: Color) -> &'static str {
@@ -197,18 +284,38 @@ fn color_name(color: Color) -> &'static str {
     }
 }
 
-fn state_json(match_id: i64, record: &crate::MatchRecord, seat: &AgentSeat, game: &Game) -> Value {
+fn state_json(
+    match_id: i64,
+    record: &crate::MatchRecord,
+    seat: &AgentSeat,
+    game: &Game,
+    chat_enabled: bool,
+    chat_messages: &[ChatMessage],
+) -> Value {
     let side_to_move = color_name(game.side_to_move());
-    let next_action = match record.status.as_str() {
-        "Finished" => "finished",
-        "Paused" => "paused",
-        "In progress" if seat.color.as_deref() == Some(side_to_move) => "move",
-        "In progress" => "wait",
-        "Waiting" if !seat.registered => "register",
-        "Waiting" => "wait",
-        _ => "wait",
+    let pending_for_you = chat_messages
+        .iter()
+        .find(|message| message.acknowledged_at.is_none() && message.sender_seat != seat.seat);
+    let any_pending = chat_messages
+        .iter()
+        .any(|message| message.acknowledged_at.is_none());
+    let next_action = if !record.is_open {
+        "closed"
+    } else if !seat.registered {
+        "register"
+    } else if chat_enabled && pending_for_you.is_some() {
+        "acknowledge"
+    } else {
+        match record.status.as_str() {
+            "Finished" => "finished",
+            "Paused" => "paused",
+            "In progress" if seat.color.as_deref() == Some(side_to_move) => "move",
+            "In progress" => "wait",
+            "Waiting" => "wait",
+            _ => "wait",
+        }
     };
-    let legal_moves = if next_action == "move" {
+    let legal_moves = if next_action == "move" && chat_enabled && pending_for_you.is_none() {
         game.legal_moves()
             .into_iter()
             .map(|m| json!({"uci": m.uci, "san": m.san}))
@@ -233,10 +340,36 @@ fn state_json(match_id: i64, record: &crate::MatchRecord, seat: &AgentSeat, game
             })
         })
         .collect();
+    let chat: Vec<Value> = chat_messages
+        .iter()
+        .map(|message| {
+            json!({
+                "id": message.id,
+                "senderSeat": message.sender_seat,
+                "senderName": message.sender_name,
+                "text": message.text,
+                "createdAt": message.created_at,
+                "acknowledgedAt": message.acknowledged_at,
+            })
+        })
+        .collect();
+    let pending_message = pending_for_you.map(|message| {
+        json!({
+            "id": message.id,
+            "senderSeat": message.sender_seat,
+            "senderName": message.sender_name,
+            "text": message.text,
+            "createdAt": message.created_at,
+        })
+    });
+    let can_resign = chat_enabled
+        && ["In progress", "Paused"].contains(&record.status.as_str())
+        && seat.color.is_some();
     json!({
         "schemaVersion": 1,
         "match": {
-            "id": match_id, "name": record.name, "status": record.status,
+            "id": match_id, "name": record.name, "status": record.status, "open": record.is_open,
+            "result": record.result, "winnerColor": record.winner_color,
             "positionVersion": game.history().len(), "ply": game.history().len(), "outcome": outcome
         },
         "agent": {
@@ -245,6 +378,13 @@ fn state_json(match_id: i64, record: &crate::MatchRecord, seat: &AgentSeat, game
         },
         "nextAction": next_action,
         "pollAfterSeconds": if next_action == "wait" { Some(3) } else { None },
+        "chat": {
+            "enabled": chat_enabled,
+            "canSend": chat_enabled && !any_pending,
+            "pendingForYou": pending_message,
+            "messages": chat
+        },
+        "actions": {"canResign": can_resign},
         "position": {
             "fen": game.fen(), "sideToMove": side_to_move, "inCheck": game.in_check(),
             "halfmoveClock": game.halfmove_clock(), "repetitionCount": game.repetition_count(),
@@ -305,6 +445,9 @@ fn make_router(state: ApiState) -> Router {
         .route("/api/matches/:match_id/ready", post(ready))
         .route("/api/matches/:match_id/state", get(get_agent_state))
         .route("/api/matches/:match_id/move", post(submit_move))
+        .route("/api/matches/:match_id/chat", post(send_chat))
+        .route("/api/matches/:match_id/chat/ack", post(acknowledge_chat))
+        .route("/api/matches/:match_id/resign", post(resign))
         .with_state(state)
 }
 
@@ -439,6 +582,110 @@ mod tests {
             call(&app, "GET", &path, Some("wrong-token"), None).await.0,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn chat_acknowledgment_gates_only_the_recipient_move() {
+        let (app, match_id, white_token, black_token) = running_match();
+        let chat_path = format!("/api/matches/{match_id}/chat");
+        let ack_path = format!("/api/matches/{match_id}/chat/ack");
+        let move_path = format!("/api/matches/{match_id}/move");
+        let state_path = format!("/api/matches/{match_id}/state");
+        let (sent, sent_body) = call(
+            &app,
+            "POST",
+            &chat_path,
+            Some(&white_token),
+            Some(r#"{"text":"heh, you don't know what's coming"}"#),
+        )
+        .await;
+        assert_eq!(sent, StatusCode::OK);
+        assert_eq!(sent_body["state"]["chat"]["canSend"], false);
+
+        let (_, black_state) = call(&app, "GET", &state_path, Some(&black_token), None).await;
+        assert_eq!(black_state["nextAction"], "acknowledge");
+        assert_eq!(
+            black_state["chat"]["pendingForYou"]["text"],
+            "heh, you don't know what's coming"
+        );
+
+        let (white_move, _) = call(
+            &app,
+            "POST",
+            &move_path,
+            Some(&white_token),
+            Some(r#"{"uci":"e2e4","position_version":0}"#),
+        )
+        .await;
+        assert_eq!(white_move, StatusCode::OK);
+        let (blocked, _) = call(
+            &app,
+            "POST",
+            &move_path,
+            Some(&black_token),
+            Some(r#"{"uci":"e7e5","position_version":1}"#),
+        )
+        .await;
+        assert_eq!(blocked, StatusCode::CONFLICT);
+
+        let message_id = black_state["chat"]["pendingForYou"]["id"].as_i64().unwrap();
+        let (acked, ack_body) = call(
+            &app,
+            "POST",
+            &ack_path,
+            Some(&black_token),
+            Some(&format!(r#"{{"message_id":{message_id},"reply":"nice"}}"#)),
+        )
+        .await;
+        assert_eq!(acked, StatusCode::OK);
+        assert_eq!(ack_body["state"]["nextAction"], "move");
+        assert_eq!(ack_body["state"]["chat"]["canSend"], false);
+        let (black_move, _) = call(
+            &app,
+            "POST",
+            &move_path,
+            Some(&black_token),
+            Some(r#"{"uci":"e7e5","position_version":1}"#),
+        )
+        .await;
+        assert_eq!(black_move, StatusCode::OK);
+        let (_, white_state) = call(&app, "GET", &state_path, Some(&white_token), None).await;
+        assert_eq!(white_state["nextAction"], "acknowledge");
+        let reply_id = white_state["chat"]["pendingForYou"]["id"].as_i64().unwrap();
+        let (reply_ack, _) = call(
+            &app,
+            "POST",
+            &ack_path,
+            Some(&white_token),
+            Some(&format!(r#"{{"message_id":{reply_id},"reply":null}}"#)),
+        )
+        .await;
+        assert_eq!(reply_ack, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn resign_ends_with_winner_and_chat_remains_available() {
+        let (app, match_id, white_token, black_token) = running_match();
+        let resign_path = format!("/api/matches/{match_id}/resign");
+        let chat_path = format!("/api/matches/{match_id}/chat");
+        let (status, result) =
+            call(&app, "POST", &resign_path, Some(&white_token), Some("{}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["state"]["match"]["result"], "resignation");
+        assert_eq!(result["state"]["match"]["winnerColor"], "black");
+        assert!(result["state"]["chat"]["enabled"].as_bool().unwrap());
+        let (sent, _) = call(
+            &app,
+            "POST",
+            &chat_path,
+            Some(&black_token),
+            Some(r#"{"text":"gg"}"#),
+        )
+        .await;
+        assert_eq!(sent, StatusCode::OK);
+        let (second_resign, _) =
+            call(&app, "POST", &resign_path, Some(&black_token), Some("{}")).await;
+        assert_eq!(second_resign, StatusCode::CONFLICT);
     }
 
     #[tokio::test]

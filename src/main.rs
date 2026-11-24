@@ -24,6 +24,19 @@ pub(crate) struct MatchRecord {
     pub(crate) status: String,
     pub(crate) fen: String,
     pub(crate) moves: String,
+    pub(crate) is_open: bool,
+    pub(crate) result: Option<String>,
+    pub(crate) winner_color: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChatMessage {
+    pub(crate) id: i64,
+    pub(crate) sender_seat: u8,
+    pub(crate) sender_name: String,
+    pub(crate) text: String,
+    pub(crate) created_at: i64,
+    pub(crate) acknowledged_at: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +53,9 @@ pub(crate) struct CreatedMatch {
     pub(crate) first_invite: String,
     pub(crate) second_invite: String,
 }
+
+const MAX_CHAT_CHARS: usize = 500;
+const MAX_CHAT_MESSAGES: i64 = 1000;
 
 pub(crate) struct Store {
     db: Connection,
@@ -67,7 +83,10 @@ impl Store {
                  status TEXT NOT NULL DEFAULT 'Waiting',
                  fen TEXT NOT NULL,
                  moves TEXT NOT NULL DEFAULT '',
-                 updated_at INTEGER NOT NULL
+                 updated_at INTEGER NOT NULL,
+                 is_open INTEGER NOT NULL DEFAULT 0,
+                 result TEXT,
+                 winner_color TEXT
              );
              CREATE TABLE IF NOT EXISTS agent_seats (
                  match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
@@ -79,14 +98,41 @@ impl Store {
                  color TEXT,
                  PRIMARY KEY(match_id, seat),
                  UNIQUE(match_id, token_hash)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS chat_messages (
+                 id INTEGER PRIMARY KEY,
+                 match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+                 sender_seat INTEGER NOT NULL CHECK(sender_seat IN (1, 2)),
+                 sender_name TEXT NOT NULL,
+                 text TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 acknowledged_at INTEGER
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS one_pending_chat_per_match
+                 ON chat_messages(match_id) WHERE acknowledged_at IS NULL;",
         )?;
+        for (column, definition) in [
+            ("is_open", "INTEGER NOT NULL DEFAULT 0"),
+            ("result", "TEXT"),
+            ("winner_color", "TEXT"),
+        ] {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('matches') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                db.execute_batch(&format!(
+                    "ALTER TABLE matches ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
         Ok(Self { db })
     }
 
     pub(crate) fn list(&self) -> rusqlite::Result<Vec<MatchRecord>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, name, white_name, black_name, status, fen, moves, updated_at
+            "SELECT id, name, white_name, black_name, status, fen, moves, is_open, result, winner_color
              FROM matches ORDER BY updated_at DESC, id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -98,6 +144,9 @@ impl Store {
                 status: row.get(4)?,
                 fen: row.get(5)?,
                 moves: row.get(6)?,
+                is_open: row.get::<_, i64>(7)? != 0,
+                result: row.get(8)?,
+                winner_color: row.get(9)?,
             })
         })?;
         rows.collect()
@@ -105,11 +154,12 @@ impl Store {
 
     pub(crate) fn get(&self, id: i64) -> rusqlite::Result<Option<MatchRecord>> {
         self.db.query_row(
-            "SELECT id, name, white_name, black_name, status, fen, moves, updated_at FROM matches WHERE id = ?1",
+            "SELECT id, name, white_name, black_name, status, fen, moves, is_open, result, winner_color FROM matches WHERE id = ?1",
             [id],
             |row| Ok(MatchRecord {
                 id: row.get(0)?, name: row.get(1)?, white_name: row.get(2)?, black_name: row.get(3)?,
                 status: row.get(4)?, fen: row.get(5)?, moves: row.get(6)?,
+                is_open: row.get::<_, i64>(7)? != 0, result: row.get(8)?, winner_color: row.get(9)?,
             }),
         ).optional()
     }
@@ -141,9 +191,10 @@ impl Store {
             .get(match_id)
             .map_err(|e| e.to_string())?
             .ok_or("Match not found")?;
-        if current.status == "Finished" || current.status == "In progress" {
+        if !current.is_open || current.status == "In progress" {
             return Err(
-                "Agents can only register before play or while a match is paused".to_owned(),
+                "Agents can register only while the match is open and waiting, paused, or finished"
+                    .to_owned(),
             );
         }
         let other_names: Vec<String> = {
@@ -173,8 +224,9 @@ impl Store {
             .get(match_id)
             .map_err(|e| e.to_string())?
             .ok_or("Match not found")?;
-        if current.status != "Waiting" && current.status != "Paused" {
-            return Err("This match is not waiting for ready agents".to_owned());
+        if !current.is_open || !["Waiting", "Paused", "Finished"].contains(&current.status.as_str())
+        {
+            return Err("This match is closed or cannot accept ready agents".to_owned());
         }
         self.db
             .execute(
@@ -199,12 +251,248 @@ impl Store {
         rows.collect()
     }
 
+    fn chat_access(&self, match_id: i64, seat: &AgentSeat) -> Result<(), String> {
+        let (is_open, status, ready_count, registered, ready, has_name): (
+            i64,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self
+            .db
+            .query_row(
+                "SELECT m.is_open, m.status,
+                    (SELECT COUNT(*) FROM agent_seats WHERE match_id = m.id AND registered = 1 AND ready = 1),
+                    COALESCE((SELECT registered FROM agent_seats WHERE match_id = m.id AND seat = ?2), 0),
+                    COALESCE((SELECT ready FROM agent_seats WHERE match_id = m.id AND seat = ?2), 0),
+                    COALESCE((SELECT agent_name IS NOT NULL FROM agent_seats WHERE match_id = m.id AND seat = ?2), 0)
+                 FROM matches m WHERE m.id = ?1",
+                params![match_id, seat.seat],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| "Match not found".to_owned())?;
+        if is_open == 0 {
+            return Err("This match is closed".to_owned());
+        }
+        if !["Waiting", "In progress", "Paused", "Finished"].contains(&status.as_str()) {
+            return Err("Chat is unavailable for this match".to_owned());
+        }
+        if ready_count != 2 || registered == 0 || ready == 0 || has_name == 0 {
+            return Err(
+                "Both agents must be registered and ready before chat is available".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn chat_enabled(&self, match_id: i64) -> Result<bool, String> {
+        let record = self
+            .get(match_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if !record.is_open
+            || !["Waiting", "In progress", "Paused", "Finished"].contains(&record.status.as_str())
+        {
+            return Ok(false);
+        }
+        let seats = self.seats(match_id).map_err(|e| e.to_string())?;
+        Ok(seats.len() == 2 && seats.iter().all(|seat| seat.registered && seat.ready))
+    }
+
+    pub(crate) fn chat_messages(&self, match_id: i64) -> rusqlite::Result<Vec<ChatMessage>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, sender_seat, sender_name, text, created_at, acknowledged_at
+             FROM chat_messages WHERE match_id = ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![match_id, MAX_CHAT_MESSAGES], |row| {
+            Ok(ChatMessage {
+                id: row.get(0)?,
+                sender_seat: row.get(1)?,
+                sender_name: row.get(2)?,
+                text: row.get(3)?,
+                created_at: row.get(4)?,
+                acknowledged_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub(crate) fn has_pending_chat_for_seat(
+        &self,
+        match_id: i64,
+        seat: u8,
+    ) -> Result<bool, String> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE match_id = ?1 AND sender_seat != ?2 AND acknowledged_at IS NULL)",
+            params![match_id, seat],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn send_chat(&self, match_id: i64, token: &str, text: &str) -> Result<i64, String> {
+        let text = validate_chat_text(text)?.ok_or("Message cannot be empty")?;
+        let seat = self.seat_for_token(match_id, token)?;
+        self.chat_access(match_id, &seat)?;
+        let transaction = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let open_row = transaction
+            .execute(
+                "UPDATE matches SET is_open = is_open WHERE id = ?1 AND is_open = 1",
+                [match_id],
+            )
+            .map_err(|e| e.to_string())?;
+        if open_row != 1 {
+            return Err("This match is closed".to_owned());
+        }
+        self.chat_access(match_id, &seat)?;
+        let pending: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE match_id = ?1 AND acknowledged_at IS NULL)",
+            [match_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if pending {
+            return Err("A message is already awaiting acknowledgment".to_owned());
+        }
+        let count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE match_id = ?1",
+                [match_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if count >= MAX_CHAT_MESSAGES {
+            return Err("This match has reached its chat history limit".to_owned());
+        }
+        let name = seat.name.as_deref().ok_or("Register before chatting")?;
+        transaction
+            .execute(
+                "INSERT INTO chat_messages(match_id, sender_seat, sender_name, text, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![match_id, seat.seat, name, text, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        let id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "UPDATE matches SET updated_at = ?1 WHERE id = ?2",
+                params![now(), match_id],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    pub(crate) fn acknowledge_chat(
+        &self,
+        match_id: i64,
+        token: &str,
+        message_id: i64,
+        reply: Option<&str>,
+    ) -> Result<(), String> {
+        let reply = reply.map(validate_chat_text).transpose()?.flatten();
+        let seat = self.seat_for_token(match_id, token)?;
+        self.chat_access(match_id, &seat)?;
+        let transaction = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let open_row = transaction
+            .execute(
+                "UPDATE matches SET is_open = is_open WHERE id = ?1 AND is_open = 1",
+                [match_id],
+            )
+            .map_err(|e| e.to_string())?;
+        if open_row != 1 {
+            return Err("This match is closed".to_owned());
+        }
+        self.chat_access(match_id, &seat)?;
+        let pending = transaction
+            .query_row(
+                "SELECT id, sender_seat FROM chat_messages
+             WHERE match_id = ?1 AND acknowledged_at IS NULL",
+                [match_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u8>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let (pending_id, sender_seat) =
+            pending.ok_or("There is no message awaiting acknowledgment")?;
+        if pending_id != message_id || sender_seat == seat.seat {
+            return Err("That message is not awaiting acknowledgment from this agent".to_owned());
+        }
+        if reply.is_some() {
+            let count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_messages WHERE match_id = ?1",
+                    [match_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if count >= MAX_CHAT_MESSAGES {
+                return Err("This match has reached its chat history limit".to_owned());
+            }
+        }
+        transaction.execute(
+            "UPDATE chat_messages SET acknowledged_at = ?1 WHERE id = ?2 AND acknowledged_at IS NULL",
+            params![now(), pending_id],
+        ).map_err(|e| e.to_string())?;
+        if let Some(reply) = reply {
+            let name = seat.name.as_deref().ok_or("Register before replying")?;
+            transaction.execute(
+                "INSERT INTO chat_messages(match_id, sender_seat, sender_name, text, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![match_id, seat.seat, name, reply, now()],
+            ).map_err(|e| e.to_string())?;
+        }
+        transaction
+            .execute(
+                "UPDATE matches SET updated_at = ?1 WHERE id = ?2",
+                params![now(), match_id],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn resign(&self, match_id: i64, token: &str) -> Result<(), String> {
+        let seat = self.seat_for_token(match_id, token)?;
+        self.chat_access(match_id, &seat)?;
+        let record = self
+            .get(match_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if !["In progress", "Paused"].contains(&record.status.as_str()) || seat.color.is_none() {
+            return Err("An agent can resign only after a match has started".to_owned());
+        }
+        let resigned_color = seat.color.as_deref().ok_or("Agent color is not assigned")?;
+        let winner_color = if resigned_color == "white" {
+            "black"
+        } else {
+            "white"
+        };
+        let changed = self.db.execute(
+            "UPDATE matches SET status = 'Finished', result = 'resignation', winner_color = ?1, updated_at = ?2
+             WHERE id = ?3 AND is_open = 1 AND status IN ('In progress', 'Paused')",
+            params![winner_color, now(), match_id],
+        ).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("This match can no longer be resigned".to_owned());
+        }
+        Ok(())
+    }
+
     pub(crate) fn start_match(&self, match_id: i64) -> Result<(), String> {
         let record = self
             .get(match_id)
             .map_err(|e| e.to_string())?
             .ok_or("Match not found")?;
-        if record.status != "Waiting" && record.status != "Paused" {
+        if !record.is_open || (record.status != "Waiting" && record.status != "Paused") {
             return Err("This match cannot be started from its current state".to_owned());
         }
         let seats = self.seats(match_id).map_err(|e| e.to_string())?;
@@ -231,7 +519,10 @@ impl Store {
             };
             self.db.execute("UPDATE agent_seats SET color = CASE seat WHEN 1 THEN ?1 ELSE ?2 END WHERE match_id = ?3", params![first_color, second_color, match_id]).map_err(|e| e.to_string())?;
         }
-        self.db.execute("UPDATE matches SET status = 'In progress', white_name = (SELECT agent_name FROM agent_seats WHERE match_id = ?1 AND color = 'white'), black_name = (SELECT agent_name FROM agent_seats WHERE match_id = ?1 AND color = 'black'), updated_at = ?2 WHERE id = ?1", params![match_id, now()]).map_err(|e| e.to_string())?;
+        let changed = self.db.execute("UPDATE matches SET status = 'In progress', result = NULL, winner_color = NULL, white_name = (SELECT agent_name FROM agent_seats WHERE match_id = ?1 AND color = 'white'), black_name = (SELECT agent_name FROM agent_seats WHERE match_id = ?1 AND color = 'black'), updated_at = ?2 WHERE id = ?1 AND is_open = 1 AND status IN ('Waiting', 'Paused')", params![match_id, now()]).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("This match was closed before it could start".to_owned());
+        }
         Ok(())
     }
 
@@ -251,7 +542,7 @@ impl Store {
             )?;
             if !exists {
                 self.db.execute(
-                    "INSERT INTO matches(name, status, fen, updated_at) VALUES(?1, 'Waiting', ?2, ?3)",
+                    "INSERT INTO matches(name, status, fen, updated_at, is_open) VALUES(?1, 'Waiting', ?2, ?3, 1)",
                     params![name, Board::default().to_string(), now()],
                 )?;
                 let id = self.db.last_insert_rowid();
@@ -284,20 +575,22 @@ impl Store {
             .get(match_id)
             .map_err(|e| e.to_string())?
             .ok_or("Match not found")?;
-        if record.status == "Finished" || record.status == "In progress" {
-            return Err(
-                "Invitations can only be refreshed for waiting or paused matches".to_owned(),
-            );
+        if record.status == "In progress" {
+            return Err("Invitations cannot be refreshed while a match is in progress".to_owned());
         }
+        self.db
+            .execute("UPDATE matches SET is_open = 1 WHERE id = ?1", [match_id])
+            .map_err(|e| e.to_string())?;
         self.mint_invites(match_id).map_err(|e| e.to_string())
     }
 
     pub(crate) fn recover_after_restart(&self) -> rusqlite::Result<()> {
         self.db.execute(
-            "UPDATE matches SET status = 'Paused', updated_at = ?1 WHERE status = 'In progress'",
+            "UPDATE matches SET status = CASE WHEN status = 'In progress' THEN 'Paused' ELSE status END, is_open = 0, updated_at = ?1",
             [now()],
         )?;
-        self.db.execute("UPDATE agent_seats SET registered = 0, ready = 0 WHERE match_id IN (SELECT id FROM matches WHERE status = 'Paused')", [])?;
+        self.db
+            .execute("UPDATE agent_seats SET registered = 0, ready = 0", [])?;
         Ok(())
     }
 
@@ -334,7 +627,7 @@ impl Store {
     }
 
     fn close_match(&self, id: i64) -> rusqlite::Result<()> {
-        self.db.execute("UPDATE matches SET status = 'Paused', updated_at = ?1 WHERE id = ?2 AND status IN ('Waiting', 'In progress')", params![now(), id])?;
+        self.db.execute("UPDATE matches SET status = CASE WHEN status IN ('Waiting', 'In progress') THEN 'Paused' ELSE status END, is_open = 0, updated_at = ?1 WHERE id = ?2", params![now(), id])?;
         self.db.execute(
             "UPDATE agent_seats SET registered = 0, ready = 0 WHERE match_id = ?1",
             [id],
@@ -342,6 +635,36 @@ impl Store {
         Ok(())
     }
 
+    fn pause_match(&self, id: i64) -> Result<(), String> {
+        let changed = self.db.execute(
+            "UPDATE matches SET status = 'Paused', updated_at = ?1 WHERE id = ?2 AND is_open = 1 AND status = 'In progress'",
+            params![now(), id],
+        ).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("Only an open, active match can be paused".to_owned());
+        }
+        Ok(())
+    }
+
+    fn end_match(&self, id: i64) -> Result<(), String> {
+        let record = self
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if record.status == "Finished" {
+            return Err("This match has already ended".to_owned());
+        }
+        let changed = self.db.execute(
+            "UPDATE matches SET status = 'Finished', result = 'ended_without_result', winner_color = NULL, updated_at = ?1 WHERE id = ?2 AND status != 'Finished'",
+            params![now(), id],
+        ).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("This match can no longer be ended".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn set_status(&self, id: i64, status: &str) -> rusqlite::Result<()> {
         self.db.execute(
             "UPDATE matches SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -350,27 +673,37 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code)] // The authenticated agent API will call this in Phase 2.
     fn play_uci(&self, id: i64, uci: &str) -> Result<PlayedMove, String> {
         let record = self
             .get(id)
             .map_err(|e| e.to_string())?
             .ok_or("Match not found")?;
-        if record.status != "In progress" {
-            return Err("Only an active match accepts moves".to_owned());
+        if record.status != "In progress" || !record.is_open {
+            return Err("Only an open, active match accepts moves".to_owned());
         }
         let mut game = Game::from_uci_history(&record.moves).map_err(|e| e.to_string())?;
         let played = game.play_uci(uci).map_err(|e| e.to_string())?;
-        let status = match game.outcome() {
-            Outcome::Checkmate { .. } | Outcome::Stalemate | Outcome::DrawAutomatic => "Finished",
-            Outcome::Ongoing | Outcome::DrawClaimAvailable => "In progress",
+        let (status, result, winner_color) = match game.outcome() {
+            Outcome::Checkmate { winner } => (
+                "Finished",
+                Some("checkmate"),
+                Some(if winner == Color::White {
+                    "white"
+                } else {
+                    "black"
+                }),
+            ),
+            Outcome::Stalemate => ("Finished", Some("stalemate"), None),
+            Outcome::DrawAutomatic => ("Finished", Some("draw"), None),
+            Outcome::Ongoing | Outcome::DrawClaimAvailable => ("In progress", None, None),
         };
-        self.db
-            .execute(
-                "UPDATE matches SET fen = ?1, moves = ?2, status = ?3, updated_at = ?4 WHERE id = ?5",
-                params![game.fen(), game.uci_history(), status, now(), id],
-            )
-            .map_err(|e| e.to_string())?;
+        let updated = self.db.execute(
+            "UPDATE matches SET fen = ?1, moves = ?2, status = ?3, result = ?4, winner_color = ?5, updated_at = ?6 WHERE id = ?7 AND status = 'In progress' AND is_open = 1",
+            params![game.fen(), game.uci_history(), status, result, winner_color, now(), id],
+        ).map_err(|e| e.to_string())?;
+        if updated != 1 {
+            return Err("Match was paused or closed before the move could be saved".to_owned());
+        }
         Ok(played)
     }
 }
@@ -381,6 +714,7 @@ struct ChessrenaApp {
     selected: Option<i64>,
     rename_target: Option<(i64, String)>,
     delete_target: Option<i64>,
+    end_target: Option<i64>,
     error: Option<String>,
     tunnel: tunnel::TunnelController,
     last_tunnel_url: Option<String>,
@@ -400,6 +734,7 @@ impl ChessrenaApp {
             selected: None,
             rename_target: None,
             delete_target: None,
+            end_target: None,
             error: None,
             tunnel: tunnel::TunnelController::start(),
             last_tunnel_url: None,
@@ -570,7 +905,9 @@ impl ChessrenaApp {
     fn open_saved_match(&mut self, id: i64) {
         if !self.invites.contains_key(&id) {
             match self.store.get(id) {
-                Ok(Some(record)) if record.status == "Waiting" || record.status == "Paused" => {
+                Ok(Some(record))
+                    if ["Waiting", "Paused", "Finished"].contains(&record.status.as_str()) =>
+                {
                     match self.store.rotate_invites(id) {
                         Ok(tokens) => {
                             self.invites.insert(id, tokens);
@@ -677,6 +1014,14 @@ impl ChessrenaApp {
                                                     self.open_saved_match(m.id);
                                                 }
                                                 ui.menu_button("⋯", |ui| {
+                                                    if m.status != "Finished"
+                                                        && ui
+                                                            .button("End match (no result)")
+                                                            .clicked()
+                                                    {
+                                                        self.end_target = Some(m.id);
+                                                        ui.close_menu();
+                                                    }
                                                     if ui.button("Rename").clicked() {
                                                         self.rename_target =
                                                             Some((m.id, m.name.clone()));
@@ -758,47 +1103,48 @@ impl ChessrenaApp {
         let game = Game::from_uci_history(&record.moves).unwrap_or_default();
         let seats = self.store.seats(id).unwrap_or_default();
         let both_ready = seats.len() == 2 && seats.iter().all(|seat| seat.registered && seat.ready);
+        let chat_enabled = record.is_open
+            && both_ready
+            && ["Waiting", "In progress", "Paused", "Finished"].contains(&record.status.as_str());
+        let chat_messages = self.store.chat_messages(id).unwrap_or_default();
         let tunnel_status = self.tunnel.status();
         ui.horizontal(|ui| {
             if ui.button("‹  Matches").clicked() {
                 if let Err(e) = self.store.close_match(id) {
                     self.error = Some(e.to_string());
                 }
+                self.invites.remove(&id);
                 self.selected = None;
             }
             ui.add_space(8.0);
             ui.heading(&record.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if record.status != "Finished"
-                    && ui
-                        .button(
-                            egui::RichText::new("End match")
-                                .color(egui::Color32::from_rgb(228, 154, 145)),
-                        )
-                        .clicked()
-                {
-                    if let Err(e) = self.store.set_status(id, "Finished") {
-                        self.error = Some(e.to_string());
+                ui.menu_button("⋯", |ui| {
+                    if record.status != "Finished" && ui.button("End match (no result)").clicked() {
+                        self.end_target = Some(id);
+                        ui.close_menu();
                     }
-                }
+                    if ui.button("Delete match").clicked() {
+                        self.delete_target = Some(id);
+                        ui.close_menu();
+                    }
+                });
             });
         });
         ui.add_space(16.0);
         ui.columns(2, |cols| {
             cols[0].horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
+                    let position_summary = if record.status == "Finished" {
+                        result_summary(&record)
+                    } else {
+                        format!(
                             "{} to move. {} legal moves.",
-                            if game.side_to_move() == Color::White {
-                                "White"
-                            } else {
-                                "Black"
-                            },
+                            if game.side_to_move() == Color::White { "White" } else { "Black" },
                             game.legal_moves_uci().len()
-                        ))
-                        .strong(),
-                    );
+                        )
+                    };
+                    ui.label(egui::RichText::new(position_summary).strong());
                     ui.add_space(8.0);
                     egui::Frame::group(ui.style())
                         .fill(surface)
@@ -916,6 +1262,36 @@ impl ChessrenaApp {
                     .stroke(egui::Stroke::new(1.0_f32, border))
                     .inner_margin(14.0)
                     .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("AGENT CHAT").small().strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(if chat_enabled { "Ready" } else { "Locked" }).small().color(egui::Color32::GRAY));
+                            });
+                        });
+                        if !chat_enabled {
+                            ui.label(egui::RichText::new("Both agents must be registered and ready; chat is unavailable while this match is closed.").small().color(egui::Color32::GRAY));
+                        }
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            if chat_messages.is_empty() {
+                                ui.label(egui::RichText::new("No messages yet.").small().color(egui::Color32::GRAY));
+                            }
+                            for message in &chat_messages {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new(&message.sender_name).strong().small());
+                                    ui.label(egui::RichText::new(&message.text).small());
+                                    ui.label(egui::RichText::new(if message.acknowledged_at.is_some() { "Seen" } else { "Awaiting acknowledgment" }).small().color(egui::Color32::GRAY));
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                        ui.label(egui::RichText::new("Read-only observer view.").small().color(egui::Color32::GRAY));
+                    });
+                ui.add_space(12.0);
+                egui::Frame::group(ui.style())
+                    .fill(surface)
+                    .stroke(egui::Stroke::new(1.0_f32, border))
+                    .inner_margin(14.0)
+                    .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new("MOVE HISTORY")
                                 .small()
@@ -931,7 +1307,13 @@ impl ChessrenaApp {
                         });
                     });
                 ui.add_space(12.0);
-                if record.status == "Paused" || record.status == "Waiting" {
+                if record.status == "In progress" {
+                    if ui.button("Pause match").clicked() {
+                        if let Err(error) = self.store.pause_match(id) {
+                            self.error = Some(error);
+                        }
+                    }
+                } else if record.status == "Paused" || record.status == "Waiting" {
                     let label = if record.status == "Paused" {
                         "Resume match"
                     } else {
@@ -981,6 +1363,34 @@ impl ChessrenaApp {
                 }
             }
         }
+        if let Some(id) = self.end_target {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("End match")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("End play without declaring a winner? The match and chat history will be kept.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                        if ui.button("End match").clicked() {
+                            confirm = true;
+                        }
+                    });
+                });
+            if !open || cancel || confirm {
+                self.end_target = None;
+            }
+            if confirm {
+                if let Err(error) = self.store.end_match(id) {
+                    self.error = Some(error);
+                }
+            }
+        }
         if let Some(id) = self.delete_target {
             let mut open = true;
             let mut confirm = false;
@@ -1013,6 +1423,10 @@ impl ChessrenaApp {
                 if let Err(e) = self.store.delete(id) {
                     self.error = Some(e.to_string());
                 }
+                self.invites.remove(&id);
+                if self.selected == Some(id) {
+                    self.selected = None;
+                }
             }
         }
         let _ = (surface, border);
@@ -1020,7 +1434,23 @@ impl ChessrenaApp {
 }
 
 fn agent_prompt(match_id: i64, seat: u8, token: &str, server_url: &str) -> String {
-    format!("You are one of two agents playing a Chessrena match. Use the official Python helper at https://github.com/goldggs/Chessrena/blob/main/agent/chessrena_agent.py. Save it in your persistent workspace and inspect the source before running it.\n\nFirst-time setup: register your distinct display name with:\npython3 chessrena_agent.py register --url {server_url} --match {match_id} --invite {token} --name YOUR_NAME\n\nIf you already registered this seat, update the saved endpoint instead (this preserves your invite token):\npython3 chessrena_agent.py set-url --match {match_id} --url {server_url}\n\nThen, when the match is waiting for agents, run:\npython3 chessrena_agent.py ready --match {match_id}\npython3 chessrena_agent.py wait --match {match_id}\npython3 chessrena_agent.py move --match {match_id} UCI_MOVE\n\nOnly submit a move listed in the latest legalMoves data, and only when nextAction is move. The URL is temporary. If Chessrena reports that it changed, rerun set-url with the new address. Your seat is Agent {seat}.")
+    format!("You are one of two agents playing a Chessrena match. Use the official Python helper at https://github.com/goldggs/Chessrena/blob/main/agent/chessrena_agent.py. Save it in your persistent workspace and inspect the source before running it.\n\nFirst-time setup: register with:\npython3 chessrena_agent.py register --url {server_url} --match {match_id} --invite {token} --name YOUR_NAME\n\nIf you already have a saved config, update its endpoint without changing your invite token:\npython3 chessrena_agent.py set-url --match {match_id} --url {server_url}\n\nMark ready, then keep polling:\npython3 chessrena_agent.py ready --match {match_id}\npython3 chessrena_agent.py wait --match {match_id}\n\nChat is available only when both agents are ready and the match is open. Send a message with `chat --match {match_id} --text \"...\"`. If nextAction is acknowledge, run `ack --match {match_id}` or `ack --match {match_id} --reply \"...\"`. A reply becomes the next message awaiting acknowledgment. Never move while you have a pending message; the server enforces this.\n\nSubmit only a listed legal move when nextAction is move: `move --match {match_id} UCI_MOVE`. You may resign a started match, including while paused, with `resign --match {match_id}`. The URL is temporary; if it changes, rerun set-url. You are Agent {seat}.")
+}
+
+fn result_summary(record: &MatchRecord) -> String {
+    let winner = match record.winner_color.as_deref() {
+        Some("white") => Some(record.white_name.as_str()),
+        Some("black") => Some(record.black_name.as_str()),
+        _ => None,
+    };
+    match record.result.as_deref() {
+        Some("checkmate") => format!("{} wins by checkmate", winner.unwrap_or("Winner")),
+        Some("resignation") => format!("{} wins by resignation", winner.unwrap_or("Opponent")),
+        Some("stalemate") => "Draw by stalemate".to_owned(),
+        Some("draw") => "Draw".to_owned(),
+        Some("ended_without_result") => "Match ended — no result".to_owned(),
+        _ => "Match finished".to_owned(),
+    }
 }
 
 fn random_invite_token() -> rusqlite::Result<String> {
@@ -1054,6 +1484,22 @@ fn data_dir() -> Result<PathBuf, String> {
         let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
         Ok(PathBuf::from(home).join(".local/share/chessrena"))
     }
+}
+
+fn validate_chat_text(text: &str) -> Result<Option<String>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_CHAT_CHARS {
+        return Err(format!(
+            "Chat messages are limited to {MAX_CHAT_CHARS} characters"
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("Chat messages cannot contain control characters".to_owned());
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 fn normalize_name(name: &str) -> String {
@@ -1108,6 +1554,34 @@ mod tests {
     fn memory_store() -> Store {
         Store::from_connection(Connection::open_in_memory().expect("in-memory SQLite should open"))
             .expect("schema should initialize")
+    }
+
+    #[test]
+    fn legacy_match_schema_is_migrated_for_open_state_and_results() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE matches (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                white_name TEXT NOT NULL DEFAULT 'Waiting for agent',
+                black_name TEXT NOT NULL DEFAULT 'Waiting for agent',
+                status TEXT NOT NULL DEFAULT 'Waiting', fen TEXT NOT NULL,
+                moves TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL
+             );",
+            )
+            .unwrap();
+        let store = Store::from_connection(connection).unwrap();
+        let columns: Vec<String> = store
+            .db
+            .prepare("PRAGMA table_info(matches)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "is_open"));
+        assert!(columns.iter().any(|column| column == "result"));
+        assert!(columns.iter().any(|column| column == "winner_color"));
     }
 
     #[test]
@@ -1197,18 +1671,15 @@ mod tests {
             .unwrap()
             .iter()
             .all(|seat| !seat.registered && !seat.ready));
+        let (first_invite, second_invite) = store.rotate_invites(created.id).unwrap();
         store
-            .register_agent(created.id, &created.first_invite, "North")
+            .register_agent(created.id, &first_invite, "North")
             .unwrap();
         store
-            .register_agent(created.id, &created.second_invite, "South")
+            .register_agent(created.id, &second_invite, "South")
             .unwrap();
-        store
-            .mark_agent_ready(created.id, &created.first_invite)
-            .unwrap();
-        store
-            .mark_agent_ready(created.id, &created.second_invite)
-            .unwrap();
+        store.mark_agent_ready(created.id, &first_invite).unwrap();
+        store.mark_agent_ready(created.id, &second_invite).unwrap();
         store.start_match(created.id).unwrap();
         let resumed_colors: Vec<_> = store
             .seats(created.id)
@@ -1217,6 +1688,141 @@ mod tests {
             .map(|seat| seat.color.clone())
             .collect();
         assert_eq!(assigned_colors, resumed_colors);
+    }
+
+    #[test]
+    fn chat_requires_both_ready_and_ack_with_reply_creates_next_pending_message() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        store
+            .register_agent(created.id, &created.first_invite, "North")
+            .unwrap();
+        store
+            .register_agent(created.id, &created.second_invite, "South")
+            .unwrap();
+        assert!(store
+            .send_chat(created.id, &created.first_invite, "hello")
+            .is_err());
+        store
+            .mark_agent_ready(created.id, &created.first_invite)
+            .unwrap();
+        assert!(store
+            .send_chat(created.id, &created.first_invite, "hello")
+            .is_err());
+        store
+            .mark_agent_ready(created.id, &created.second_invite)
+            .unwrap();
+
+        let first_id = store
+            .send_chat(created.id, &created.first_invite, "  hello there  ")
+            .unwrap();
+        assert!(store
+            .send_chat(created.id, &created.first_invite, "another")
+            .is_err());
+        assert!(store
+            .acknowledge_chat(created.id, &created.first_invite, first_id, None)
+            .is_err());
+        store
+            .acknowledge_chat(
+                created.id,
+                &created.second_invite,
+                first_id,
+                Some("nice move"),
+            )
+            .unwrap();
+        let messages = store.chat_messages(created.id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "hello there");
+        assert!(messages[0].acknowledged_at.is_some());
+        assert_eq!(messages[1].sender_seat, 2);
+        assert_eq!(messages[1].text, "nice move");
+        assert!(messages[1].acknowledged_at.is_none());
+    }
+
+    #[test]
+    fn closing_disables_chat_and_reopening_rotates_invites() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        for (token, name) in [
+            (&created.first_invite, "North"),
+            (&created.second_invite, "South"),
+        ] {
+            store.register_agent(created.id, token, name).unwrap();
+            store.mark_agent_ready(created.id, token).unwrap();
+        }
+        assert!(store.chat_enabled(created.id).unwrap());
+        store.close_match(created.id).unwrap();
+        assert!(!store.chat_enabled(created.id).unwrap());
+        assert!(store
+            .send_chat(created.id, &created.first_invite, "closed")
+            .is_err());
+        let (new_first, new_second) = store.rotate_invites(created.id).unwrap();
+        assert!(store
+            .seat_for_token(created.id, &created.first_invite)
+            .is_err());
+        store
+            .register_agent(created.id, &new_first, "North")
+            .unwrap();
+        store
+            .register_agent(created.id, &new_second, "South")
+            .unwrap();
+        store.mark_agent_ready(created.id, &new_first).unwrap();
+        store.mark_agent_ready(created.id, &new_second).unwrap();
+        assert!(store.chat_enabled(created.id).unwrap());
+    }
+
+    #[test]
+    fn agent_can_resign_a_started_paused_match_and_awards_opponent() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        for (token, name) in [
+            (&created.first_invite, "North"),
+            (&created.second_invite, "South"),
+        ] {
+            store.register_agent(created.id, token, name).unwrap();
+            store.mark_agent_ready(created.id, token).unwrap();
+        }
+        store.start_match(created.id).unwrap();
+        store.pause_match(created.id).unwrap();
+        let resigning_seat = store
+            .seat_for_token(created.id, &created.first_invite)
+            .unwrap();
+        let winner_color = if resigning_seat.color.as_deref() == Some("white") {
+            "black"
+        } else {
+            "white"
+        };
+        store.resign(created.id, &created.first_invite).unwrap();
+        let ended = store.get(created.id).unwrap().unwrap();
+        assert_eq!(ended.status, "Finished");
+        assert_eq!(ended.result.as_deref(), Some("resignation"));
+        assert_eq!(ended.winner_color.as_deref(), Some(winner_color));
+    }
+
+    #[test]
+    fn checkmate_result_is_persisted_for_postgame_state() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        store.set_status(created.id, "In progress").unwrap();
+        for uci in ["f2f3", "e7e5", "g2g4", "d8h4"] {
+            store.play_uci(created.id, uci).unwrap();
+        }
+        let ended = store.get(created.id).unwrap().unwrap();
+        assert_eq!(ended.status, "Finished");
+        assert_eq!(ended.result.as_deref(), Some("checkmate"));
+        assert_eq!(ended.winner_color.as_deref(), Some("black"));
+    }
+
+    #[test]
+    fn manual_end_keeps_match_without_winner() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        store.end_match(created.id).unwrap();
+        let ended = store.get(created.id).unwrap().unwrap();
+        assert_eq!(ended.status, "Finished");
+        assert_eq!(ended.result.as_deref(), Some("ended_without_result"));
+        assert_eq!(ended.winner_color, None);
+        assert!(store.get(created.id).unwrap().is_some());
     }
 
     #[test]

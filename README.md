@@ -29,6 +29,8 @@ Phase 2 adds the loopback-only authenticated agent API and a standard-library Py
 
 Phase 3 starts an account-free Cloudflare Quick Tunnel through `cloudflared`. If needed, the user can explicitly download the pinned Windows x64 executable; Chessrena verifies its SHA-256 before running it. The UI displays the live HTTPS URL and includes it in agent prompts; agents can update their saved URL with `set-url` if it changes. The URL is public and temporary, and Cloudflare terminates HTTPS; see [SECURITY.md](SECURITY.md) before using remote agents.
 
+Phase 4 adds agent-only chat and resignation. Chat requires both agents to be registered and ready while the match view is open. A single pending message must be acknowledged before its recipient can move; an acknowledgment may include a reply. The owner sees a read-only transcript. Leaving the match view closes agent access and rotates invitations when it is reopened. Agents may resign a started match while it is running or paused; the other side wins by resignation. Manual End match records no result and keeps history; Delete remains separate.
+
 ## Product principles
 
 - One running match at a time, with saved matches in the library.

@@ -94,6 +94,8 @@ def request_json(server: str, path: str, token: str, method: str = "GET", payloa
 
 def persist_state(path: Path, config: dict, state: dict) -> None:
     config["positionVersion"] = state.get("match", {}).get("positionVersion", 0)
+    pending = state.get("chat", {}).get("pendingForYou")
+    config["pendingChatId"] = pending.get("id") if isinstance(pending, dict) else None
     legal = state.get("position", {}).get("legalMoves", [])
     config["legalMoves"] = [item.get("uci") for item in legal if isinstance(item, dict) and item.get("uci")]
     save_config(path, config)
@@ -147,7 +149,13 @@ def command_wait(args: argparse.Namespace) -> None:
         state = request_json(config["server"], f"/api/matches/{args.match}/state", config["token"])
         persist_state(path, config, state)
         action = state.get("nextAction")
-        if action != "wait" or time.monotonic() >= deadline:
+        chat = state.get("chat", {})
+        wait_for_chat = (
+            action in {"paused", "finished"}
+            and chat.get("enabled") is True
+            and not chat.get("pendingForYou")
+        )
+        if (action != "wait" and not wait_for_chat) or time.monotonic() >= deadline:
             print(json.dumps(state, ensure_ascii=False, indent=2))
             return
         time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
@@ -160,8 +168,48 @@ def command_set_url(args: argparse.Namespace) -> None:
     print(json.dumps({"matchId": args.match, "server": config["server"], "updated": True}, indent=2))
 
 
+def command_chat(args: argparse.Namespace) -> None:
+    path, config = load_config(args.match)
+    result = request_json(
+        config["server"], f"/api/matches/{args.match}/chat", config["token"], "POST", {"text": args.text}
+    )
+    state = result.get("state")
+    if isinstance(state, dict):
+        persist_state(path, config, state)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def command_ack(args: argparse.Namespace) -> None:
+    path, config = load_config(args.match)
+    state = request_json(config["server"], f"/api/matches/{args.match}/state", config["token"])
+    pending = state.get("chat", {}).get("pendingForYou")
+    if not isinstance(pending, dict) or not isinstance(pending.get("id"), int):
+        raise ValueError("There is no incoming message to acknowledge.")
+    payload = {"message_id": pending["id"], "reply": args.reply}
+    result = request_json(
+        config["server"], f"/api/matches/{args.match}/chat/ack", config["token"], "POST", payload
+    )
+    updated = result.get("state")
+    if isinstance(updated, dict):
+        persist_state(path, config, updated)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def command_resign(args: argparse.Namespace) -> None:
+    path, config = load_config(args.match)
+    result = request_json(
+        config["server"], f"/api/matches/{args.match}/resign", config["token"], "POST", {}
+    )
+    state = result.get("state")
+    if isinstance(state, dict):
+        persist_state(path, config, state)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def command_move(args: argparse.Namespace) -> None:
     path, config = load_config(args.match)
+    if config.get("pendingChatId") is not None:
+        raise ValueError("Acknowledge the incoming chat message before moving.")
     if args.uci not in config.get("legalMoves", []):
         raise ValueError("That move was not in the latest legalMoves list. Run wait or state to refresh first.")
     result = request_json(
@@ -203,6 +251,20 @@ def main() -> int:
     set_url.add_argument("--match", required=True, type=int)
     set_url.add_argument("--url", required=True)
     set_url.set_defaults(run=command_set_url)
+
+    chat = commands.add_parser("chat", help="Send a plain-text message when chat is enabled.")
+    chat.add_argument("--match", required=True, type=int)
+    chat.add_argument("--text", required=True, help="Message text, up to 500 characters.")
+    chat.set_defaults(run=command_chat)
+
+    ack = commands.add_parser("ack", help="Acknowledge the incoming message, optionally with a reply.")
+    ack.add_argument("--match", required=True, type=int)
+    ack.add_argument("--reply", help="Optional reply; it becomes the next message awaiting acknowledgment.")
+    ack.set_defaults(run=command_ack)
+
+    resign = commands.add_parser("resign", help="Resign a started match, including while it is paused.")
+    resign.add_argument("--match", required=True, type=int)
+    resign.set_defaults(run=command_resign)
 
     move = commands.add_parser("move", help="Submit a listed UCI move.")
     move.add_argument("--match", required=True, type=int)
