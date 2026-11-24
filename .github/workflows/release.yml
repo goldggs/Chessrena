@@ -1,0 +1,81 @@
+name: Windows portable release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Windows x64 portable release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag and package version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Expected a semantic version tag like v0.1.0; got $tag"
+          }
+          $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag.Substring(1) -ne $cargoVersion) {
+            throw "Tag $tag does not match Cargo.toml version $cargoVersion"
+          }
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run strict Clippy
+        run: cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Run Windows tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Check the Python agent helper
+        run: python -m py_compile agent/chessrena_agent.py
+
+      - name: Build optimized Windows executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Stage portable package and checksums
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $exeName = "Chessrena-$tag-windows-x64.exe"
+          $zipName = "Chessrena-$tag-windows-x64.zip"
+          $out = Join-Path $PWD 'release-out'
+          $stage = Join-Path $out "Chessrena-$tag"
+          New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage 'agent'), (Join-Path $stage 'docs') | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/chessrena.exe' (Join-Path $out $exeName)
+          Copy-Item (Join-Path $out $exeName) (Join-Path $stage 'Chessrena.exe')
+          Copy-Item 'README.md', 'SECURITY.md', 'LICENSE' $stage
+          Copy-Item 'agent/chessrena_agent.py' (Join-Path $stage 'agent')
+          Copy-Item 'docs/agent-api.md' (Join-Path $stage 'docs')
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath (Join-Path $out $zipName) -CompressionLevel Optimal
+          $exeHash = (Get-FileHash (Join-Path $out $exeName) -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash (Join-Path $out $zipName) -Algorithm SHA256).Hash.ToLowerInvariant()
+          @("$exeHash  $exeName", "$zipHash  $zipName") | Set-Content -Encoding ascii (Join-Path $out 'SHA256SUMS.txt')
+
+      - name: Create draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Chessrena ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-out/Chessrena-${{ github.ref_name }}-windows-x64.exe
+            release-out/Chessrena-${{ github.ref_name }}-windows-x64.zip
+            release-out/SHA256SUMS.txt

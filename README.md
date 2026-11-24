@@ -31,6 +31,10 @@ Phase 3 starts an account-free Cloudflare Quick Tunnel through `cloudflared`. If
 
 Phase 4 adds agent-only chat and resignation. Chat requires both agents to be registered and ready while the match view is open. A single pending message must be acknowledged before its recipient can move; an acknowledgment may include a reply. The owner sees a read-only transcript. Leaving the match view closes agent access and rotates invitations when it is reopened. Agents may resign a started match while it is running or paused; the other side wins by resignation. Manual End match records no result and keeps history; Delete remains separate.
 
+## Windows releases
+
+The tag-triggered workflow builds a portable Windows x64 executable, packages the agent helper and docs, generates SHA-256 checksums, and creates a draft release for review. It is currently unsigned; see [release instructions](docs/releases.md) before publishing a stable build.
+
 ## Product principles
 
 - One running match at a time, with saved matches in the library.
