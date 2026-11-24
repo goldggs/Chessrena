@@ -544,10 +544,10 @@ impl ChessrenaApp {
 fn data_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("LOCALAPPDATA")
+        std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .map(|p| p.join("Chessrena"))
-            .ok_or_else(|| "LOCALAPPDATA is not set".to_owned());
+            .ok_or_else(|| "LOCALAPPDATA is not set".to_owned())
     }
     #[cfg(not(target_os = "windows"))]
     {
