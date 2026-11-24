@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Chessrena square mark</title>
+  <desc id="desc">A rook with the letters CR at the lower right on a dark square.</desc>
+  <rect width="128" height="128" rx="16" fill="#111412"/>
+  <path d="M34 23h10v10h7V23h10v10h7V23h10v19h-7v34h9v11H32V76h9V42h-7z" fill="#e8ece8"/>
+  <path d="M32 89h49" stroke="#a8d5b1" stroke-width="3" stroke-linecap="square"/>
+  <text x="91" y="108" fill="#a8d5b1" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" font-weight="700" letter-spacing="-0.6">CR</text>
+</svg>

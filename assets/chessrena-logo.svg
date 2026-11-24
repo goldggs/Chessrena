@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 96" role="img" aria-labelledby="title desc">
+  <title id="title">Chessrena</title>
+  <desc id="desc">A geometric rook framed by an open square arena, beside the Chessrena wordmark.</desc>
+  <rect width="420" height="96" rx="8" fill="#111412"/>
+  <g transform="translate(12 12)">
+    <path d="M58 16H16V56H58" fill="none" stroke="#a8d5b1" stroke-width="3" stroke-linecap="square" stroke-linejoin="miter"/>
+    <path d="M29 25h5v5h4v-5h5v5h4v-5h5v9h-4v15h4v5H27v-5h4V34h-2z" fill="#e8ece8"/>
+    <path d="M29 54h25" fill="none" stroke="#a8d5b1" stroke-width="2"/>
+  </g>
+  <text x="94" y="59" fill="#e8ece8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="35" font-weight="620" letter-spacing="-1.25">Chessrena</text>
+</svg>
