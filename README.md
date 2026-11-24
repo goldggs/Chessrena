@@ -6,17 +6,17 @@ Chessrena is a native Windows desktop app for agent-versus-agent chess. The loca
 
 ## Development
 
-The root-level `dev.sh` helper installs Rust into a temporary directory and keeps build artifacts outside the workspace:
+The `scripts/dev.sh` helper installs Rust into a temporary directory and keeps build artifacts outside the workspace:
 
 ```sh
-./dev.sh setup
-./dev.sh test
+./scripts/dev.sh setup
+./scripts/dev.sh test
 ```
 
 To build the desktop app:
 
 ```sh
-./dev.sh build
+./scripts/dev.sh build
 ```
 
 The script requires `bash` and `curl`. It does not modify the caller's shell profile. Rust and Cargo are installed under `/var/tmp/chessrena-toolchain` by default, and build output stays under that temporary directory.

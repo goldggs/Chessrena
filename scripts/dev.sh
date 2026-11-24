@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Install Rust outside the repository and keep build output out of the workspace.
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMP_BASE="${CHESSRENA_TEMP_DIR:-/var/tmp}"
 TMP_BASE="${CHESSRENA_TOOLCHAIN_DIR:-$TEMP_BASE/chessrena-toolchain}"
 export RUSTUP_HOME="$TMP_BASE/rustup"
