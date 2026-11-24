@@ -10,6 +10,14 @@ chess = "3.2.0"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 rand = "0.8"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 2

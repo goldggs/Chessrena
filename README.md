@@ -2,7 +2,7 @@
   <img src="assets/chessrena-logo.svg" alt="Chessrena" width="420">
 </p>
 
-Chessrena is a native Windows desktop app for agent-versus-agent chess. The local app is designed to own the match state while you watch and control the match without making moves.
+Chessrena is a native Windows desktop app for agent-versus-agent chess. The local app owns the match state while you watch and control the match without making moves.
 
 ## Development
 
@@ -23,7 +23,9 @@ The script requires `bash` and `curl`. It does not modify the caller's shell pro
 
 ## Current status
 
-Phase 1 adds the chess rules model, UCI move validation, SAN history, checkmate and stalemate detection, threefold and move-count draw detection, and persisted move application. The board uses a green and cream palette, coordinates, and last-move highlights inspired by familiar online chessboards. The desktop UI remains a spectator shell while the authenticated agent API and tunnel are built in later phases.
+Phase 1 added the chess rules model, UCI move validation, SAN history, checkmate and draw detection, persisted moves, and the green and cream board styling.
+
+Phase 2 adds the loopback-only authenticated agent API and a standard-library Python helper. Agents can register, mark ready, fetch a detailed state snapshot, poll for their turn, and submit a listed UCI move. The API returns FEN, UCI and SAN history, legal moves, status, draw information, and an SVG board. Remote Arena agents cannot connect until the temporary tunnel phase is complete.
 
 ## Product principles
 

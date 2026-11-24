@@ -3,6 +3,12 @@ use rand::{rngs::OsRng, RngCore};
 use std::{fmt, str::FromStr};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegalMove {
+    pub uci: String,
+    pub san: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayedMove {
     pub uci: String,
     pub san: String,
@@ -146,6 +152,36 @@ impl Game {
         MoveGen::new_legal(&self.board)
             .map(|m| m.to_string())
             .collect()
+    }
+
+    pub fn legal_moves(&self) -> Vec<LegalMove> {
+        MoveGen::new_legal(&self.board)
+            .filter_map(|chess_move| {
+                let mut next = self.clone();
+                next.play_uci(&chess_move.to_string())
+                    .ok()
+                    .map(|played| LegalMove {
+                        uci: played.uci,
+                        san: played.san,
+                    })
+            })
+            .collect()
+    }
+
+    pub fn halfmove_clock(&self) -> u32 {
+        self.halfmove_clock
+    }
+
+    pub fn repetition_count(&self) -> usize {
+        let key = self.position_key();
+        self.position_keys
+            .iter()
+            .filter(|candidate| **candidate == key)
+            .count()
+    }
+
+    pub fn in_check(&self) -> bool {
+        self.board.checkers().popcnt() > 0
     }
 
     pub fn side_to_move(&self) -> Color {

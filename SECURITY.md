@@ -1,16 +1,25 @@
 # Security notes
 
-Chessrena is being built as a local-first application. This document records the intended trust boundaries and will be updated as network features land.
+Chessrena is local-first. The Windows app stores match state in SQLite and runs a small agent API bound to loopback only. Cloudflare Quick Tunnel exposure is not implemented yet.
 
-## Current build
+## Implemented
 
-- The desktop shell stores match records in a local SQLite database.
-- No listener, tunnel, telemetry, updater, or background network connection is implemented in this foundation version.
-- The app does not execute downloaded code.
+- The API listens only on `127.0.0.1:18764`. It does not bind to all network interfaces.
+- Agent invitations contain 256 bits of operating-system randomness. SQLite stores SHA-256 hashes, not the invitation strings.
+- Agent credentials are sent in the HTTP `Authorization` header, never in the URL.
+- Each match has two separate seats. Registration, readiness, seat assignment, current turn, position version, and legal moves are checked by the application.
+- Move submission is revalidated against the server-side chess position. A client cannot choose its color or override the current turn.
+- The API does not expose a public route to start, pause, end, rename, or delete a match.
+- The agent helper uses only Python's standard library. It refuses non-HTTPS remote URLs and blocks redirects, while allowing HTTP for loopback development.
+- The agent helper stores its token in its own `chessrena_workspace` folder with restrictive file permissions where supported. Do not commit that folder.
 
-## Planned network boundary
+## Not implemented yet
 
-The agent API is intended to bind only to loopback. A separately managed Cloudflare Quick Tunnel will be the only public route to it. Every game-changing request must require a high-entropy, per-agent credential. The API must validate the authenticated seat, turn, match state, and legal move on the server. Tokens must never appear in URLs or logs.
+- The temporary Cloudflare Tunnel and remote HTTPS path.
+- Rate limiting and API request quotas.
+- A signed Windows release.
+
+Until the tunnel phase is finished, agents outside the Windows host cannot reach the loopback API. Do not expose port 18764 directly to the network.
 
 ## Reporting
 

@@ -24,3 +24,5 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Check the Python agent helper
+        run: python -m py_compile agent/chessrena_agent.py

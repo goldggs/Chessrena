@@ -1,4 +1,7 @@
 /target/
+__pycache__/
+*.py[cod]
+chessrena_workspace/
 *.db
 *.db-shm
 *.db-wal

@@ -1,35 +1,57 @@
+mod api;
+
 use chess::{Board, Color, File, Piece, Rank, Square};
-use chessrena::game::{Game, Outcome, PlayedMove};
+use chessrena::game::{first_seat_gets_white, Game, Outcome, PlayedMove};
 use eframe::egui;
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug)]
-struct MatchRecord {
-    id: i64,
-    name: String,
-    white_name: String,
-    black_name: String,
-    status: String,
-    fen: String,
-    moves: String,
+pub(crate) struct MatchRecord {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) white_name: String,
+    pub(crate) black_name: String,
+    pub(crate) status: String,
+    pub(crate) fen: String,
+    pub(crate) moves: String,
 }
 
-struct Store {
+#[derive(Clone, Debug)]
+pub(crate) struct AgentSeat {
+    pub(crate) seat: u8,
+    pub(crate) name: Option<String>,
+    pub(crate) registered: bool,
+    pub(crate) ready: bool,
+    pub(crate) color: Option<String>,
+}
+
+pub(crate) struct CreatedMatch {
+    pub(crate) id: i64,
+    pub(crate) first_invite: String,
+    pub(crate) second_invite: String,
+}
+
+pub(crate) struct Store {
     db: Connection,
 }
 
 impl Store {
-    fn open(path: PathBuf) -> rusqlite::Result<Self> {
+    pub(crate) fn open(path: PathBuf) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         }
-        Self::from_connection(Connection::open(path)?)
+        let db = Connection::open(path)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::from_connection(db)
     }
 
     fn from_connection(db: Connection) -> rusqlite::Result<Self> {
@@ -44,12 +66,23 @@ impl Store {
                  fen TEXT NOT NULL,
                  moves TEXT NOT NULL DEFAULT '',
                  updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS agent_seats (
+                 match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+                 seat INTEGER NOT NULL CHECK(seat IN (1, 2)),
+                 token_hash TEXT NOT NULL,
+                 agent_name TEXT,
+                 registered INTEGER NOT NULL DEFAULT 0,
+                 ready INTEGER NOT NULL DEFAULT 0,
+                 color TEXT,
+                 PRIMARY KEY(match_id, seat),
+                 UNIQUE(match_id, token_hash)
              );",
         )?;
         Ok(Self { db })
     }
 
-    fn list(&self) -> rusqlite::Result<Vec<MatchRecord>> {
+    pub(crate) fn list(&self) -> rusqlite::Result<Vec<MatchRecord>> {
         let mut stmt = self.db.prepare(
             "SELECT id, name, white_name, black_name, status, fen, moves, updated_at
              FROM matches ORDER BY updated_at DESC, id DESC",
@@ -68,7 +101,7 @@ impl Store {
         rows.collect()
     }
 
-    fn get(&self, id: i64) -> rusqlite::Result<Option<MatchRecord>> {
+    pub(crate) fn get(&self, id: i64) -> rusqlite::Result<Option<MatchRecord>> {
         self.db.query_row(
             "SELECT id, name, white_name, black_name, status, fen, moves, updated_at FROM matches WHERE id = ?1",
             [id],
@@ -79,7 +112,133 @@ impl Store {
         ).optional()
     }
 
+    pub(crate) fn seat_for_token(&self, match_id: i64, token: &str) -> Result<AgentSeat, String> {
+        let hashed = hash_token(token);
+        self.db.query_row(
+            "SELECT seat, agent_name, registered, ready, color FROM agent_seats WHERE match_id = ?1 AND token_hash = ?2",
+            params![match_id, hashed],
+            |row| Ok(AgentSeat {
+                seat: row.get(0)?, name: row.get(1)?, registered: row.get::<_, i64>(2)? != 0,
+                ready: row.get::<_, i64>(3)? != 0, color: row.get(4)?,
+            }),
+        ).map_err(|_| "Invalid match invitation".to_owned())
+    }
+
+    pub(crate) fn register_agent(
+        &self,
+        match_id: i64,
+        token: &str,
+        name: &str,
+    ) -> Result<AgentSeat, String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
+            return Err("Agent name must be 1 to 40 visible characters".to_owned());
+        }
+        let seat = self.seat_for_token(match_id, token)?;
+        let current = self
+            .get(match_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if current.status == "Finished" || current.status == "In progress" {
+            return Err(
+                "Agents can only register before play or while a match is paused".to_owned(),
+            );
+        }
+        let other_names: Vec<String> = {
+            let mut stmt = self.db.prepare("SELECT agent_name FROM agent_seats WHERE match_id = ?1 AND seat != ?2 AND agent_name IS NOT NULL").map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![match_id, seat.seat], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if other_names
+            .iter()
+            .any(|other| other.trim().to_lowercase() == name.to_lowercase())
+        {
+            return Err("That agent name is already used in this match".to_owned());
+        }
+        self.db.execute("UPDATE agent_seats SET agent_name = ?1, registered = 1, ready = 0 WHERE match_id = ?2 AND seat = ?3", params![name, match_id, seat.seat]).map_err(|e| e.to_string())?;
+        self.seat_for_token(match_id, token)
+    }
+
+    pub(crate) fn mark_agent_ready(&self, match_id: i64, token: &str) -> Result<AgentSeat, String> {
+        let seat = self.seat_for_token(match_id, token)?;
+        if !seat.registered {
+            return Err("Register an agent name before marking ready".to_owned());
+        }
+        let current = self
+            .get(match_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if current.status != "Waiting" && current.status != "Paused" {
+            return Err("This match is not waiting for ready agents".to_owned());
+        }
+        self.db
+            .execute(
+                "UPDATE agent_seats SET ready = 1 WHERE match_id = ?1 AND seat = ?2",
+                params![match_id, seat.seat],
+            )
+            .map_err(|e| e.to_string())?;
+        self.seat_for_token(match_id, token)
+    }
+
+    pub(crate) fn seats(&self, match_id: i64) -> rusqlite::Result<Vec<AgentSeat>> {
+        let mut stmt = self.db.prepare("SELECT seat, agent_name, registered, ready, color FROM agent_seats WHERE match_id = ?1 ORDER BY seat")?;
+        let rows = stmt.query_map([match_id], |row| {
+            Ok(AgentSeat {
+                seat: row.get(0)?,
+                name: row.get(1)?,
+                registered: row.get::<_, i64>(2)? != 0,
+                ready: row.get::<_, i64>(3)? != 0,
+                color: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub(crate) fn start_match(&self, match_id: i64) -> Result<(), String> {
+        let record = self
+            .get(match_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if record.status != "Waiting" && record.status != "Paused" {
+            return Err("This match cannot be started from its current state".to_owned());
+        }
+        let seats = self.seats(match_id).map_err(|e| e.to_string())?;
+        if seats.len() != 2 || seats.iter().any(|s| !s.registered || !s.ready) {
+            return Err("Both agents must register and mark ready first".to_owned());
+        }
+        let active: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM matches WHERE status = 'In progress' AND id != ?1",
+                [match_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if active > 0 {
+            return Err("Only one match can run at a time".to_owned());
+        }
+        if seats.iter().any(|seat| seat.color.is_none()) {
+            let first_is_white = first_seat_gets_white().map_err(|e| e.to_string())?;
+            let (first_color, second_color) = if first_is_white {
+                ("white", "black")
+            } else {
+                ("black", "white")
+            };
+            self.db.execute("UPDATE agent_seats SET color = CASE seat WHEN 1 THEN ?1 ELSE ?2 END WHERE match_id = ?3", params![first_color, second_color, match_id]).map_err(|e| e.to_string())?;
+        }
+        self.db.execute("UPDATE matches SET status = 'In progress', white_name = (SELECT agent_name FROM agent_seats WHERE match_id = ?1 AND color = 'white'), black_name = (SELECT agent_name FROM agent_seats WHERE match_id = ?1 AND color = 'black'), updated_at = ?2 WHERE id = ?1", params![match_id, now()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn create(&self) -> rusqlite::Result<i64> {
+        self.create_with_invites().map(|created| created.id)
+    }
+
+    pub(crate) fn create_with_invites(&self) -> rusqlite::Result<CreatedMatch> {
         let mut n = 1;
         loop {
             let name = format!("New match {n}");
@@ -93,10 +252,51 @@ impl Store {
                     "INSERT INTO matches(name, status, fen, updated_at) VALUES(?1, 'Waiting', ?2, ?3)",
                     params![name, Board::default().to_string(), now()],
                 )?;
-                return Ok(self.db.last_insert_rowid());
+                let id = self.db.last_insert_rowid();
+                let (first_invite, second_invite) = self.mint_invites(id)?;
+                return Ok(CreatedMatch {
+                    id,
+                    first_invite,
+                    second_invite,
+                });
             }
             n += 1;
         }
+    }
+
+    fn mint_invites(&self, match_id: i64) -> rusqlite::Result<(String, String)> {
+        let first = random_invite_token()?;
+        let second = random_invite_token()?;
+        for (seat, token) in [(1_i64, &first), (2_i64, &second)] {
+            self.db.execute(
+                "INSERT INTO agent_seats(match_id, seat, token_hash) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(match_id, seat) DO UPDATE SET token_hash = excluded.token_hash, registered = 0, ready = 0",
+                params![match_id, seat, hash_token(token)],
+            )?;
+        }
+        Ok((first, second))
+    }
+
+    pub(crate) fn rotate_invites(&self, match_id: i64) -> Result<(String, String), String> {
+        let record = self
+            .get(match_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if record.status == "Finished" || record.status == "In progress" {
+            return Err(
+                "Invitations can only be refreshed for waiting or paused matches".to_owned(),
+            );
+        }
+        self.mint_invites(match_id).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn recover_after_restart(&self) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE matches SET status = 'Paused', updated_at = ?1 WHERE status = 'In progress'",
+            [now()],
+        )?;
+        self.db.execute("UPDATE agent_seats SET registered = 0, ready = 0 WHERE match_id IN (SELECT id FROM matches WHERE status = 'Paused')", [])?;
+        Ok(())
     }
 
     fn rename(&self, id: i64, name: &str) -> rusqlite::Result<()> {
@@ -104,6 +304,19 @@ impl Store {
         if clean.is_empty() || clean.chars().count() > 48 {
             return Err(rusqlite::Error::InvalidParameterName(
                 "Match name must be 1 to 48 characters".into(),
+            ));
+        }
+        let other_names = {
+            let mut statement = self.db.prepare("SELECT name FROM matches WHERE id != ?1")?;
+            let rows = statement.query_map([id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if other_names
+            .iter()
+            .any(|other| normalize_name(other) == normalize_name(clean))
+        {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "That match name is already in use".into(),
             ));
         }
         self.db.execute(
@@ -119,7 +332,11 @@ impl Store {
     }
 
     fn close_match(&self, id: i64) -> rusqlite::Result<()> {
-        self.db.execute("UPDATE matches SET status = 'Paused', updated_at = ?1 WHERE id = ?2 AND status = 'In progress'", params![now(), id])?;
+        self.db.execute("UPDATE matches SET status = 'Paused', updated_at = ?1 WHERE id = ?2 AND status IN ('Waiting', 'In progress')", params![now(), id])?;
+        self.db.execute(
+            "UPDATE agent_seats SET registered = 0, ready = 0 WHERE match_id = ?1",
+            [id],
+        )?;
         Ok(())
     }
 
@@ -158,6 +375,7 @@ impl Store {
 
 struct ChessrenaApp {
     store: Store,
+    invites: HashMap<i64, (String, String)>,
     selected: Option<i64>,
     rename_target: Option<(i64, String)>,
     delete_target: Option<i64>,
@@ -167,10 +385,13 @@ struct ChessrenaApp {
 impl ChessrenaApp {
     fn new() -> Result<Self, String> {
         let path = data_dir()?.join("chessrena.db");
-        let store =
-            Store::open(path).map_err(|e| format!("Could not open local match database: {e}"))?;
+        let store = Store::open(path.clone())
+            .map_err(|e| format!("Could not open local match database: {e}"))?;
+        store.recover_after_restart().map_err(|e| e.to_string())?;
+        api::spawn(path);
         Ok(Self {
             store,
+            invites: HashMap::new(),
             selected: None,
             rename_target: None,
             delete_target: None,
@@ -326,6 +547,30 @@ impl eframe::App for ChessrenaApp {
 }
 
 impl ChessrenaApp {
+    fn open_saved_match(&mut self, id: i64) {
+        if !self.invites.contains_key(&id) {
+            match self.store.get(id) {
+                Ok(Some(record)) if record.status == "Waiting" || record.status == "Paused" => {
+                    match self.store.rotate_invites(id) {
+                        Ok(tokens) => {
+                            self.invites.insert(id, tokens);
+                        }
+                        Err(error) => {
+                            self.error = Some(error);
+                            return;
+                        }
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+        self.selected = Some(id);
+    }
+
     fn show_home(
         &mut self,
         ui: &mut egui::Ui,
@@ -353,8 +598,12 @@ impl ChessrenaApp {
                     )
                     .clicked()
                 {
-                    match self.store.create() {
-                        Ok(id) => self.selected = Some(id),
+                    match self.store.create_with_invites() {
+                        Ok(created) => {
+                            self.invites
+                                .insert(created.id, (created.first_invite, created.second_invite));
+                            self.selected = Some(created.id);
+                        }
                         Err(e) => self.error = Some(e.to_string()),
                     }
                 }
@@ -405,7 +654,7 @@ impl ChessrenaApp {
                                                     )
                                                     .clicked()
                                                 {
-                                                    self.selected = Some(m.id);
+                                                    self.open_saved_match(m.id);
                                                 }
                                                 ui.menu_button("⋯", |ui| {
                                                     if ui.button("Rename").clicked() {
@@ -449,7 +698,7 @@ impl ChessrenaApp {
                                                 )
                                                 .clicked()
                                             {
-                                                self.selected = Some(m.id);
+                                                self.open_saved_match(m.id);
                                             }
                                         });
                                     });
@@ -487,6 +736,8 @@ impl ChessrenaApp {
             }
         };
         let game = Game::from_uci_history(&record.moves).unwrap_or_default();
+        let seats = self.store.seats(id).unwrap_or_default();
+        let both_ready = seats.len() == 2 && seats.iter().all(|seat| seat.registered && seat.ready);
         ui.horizontal(|ui| {
             if ui.button("‹  Matches").clicked() {
                 if let Err(e) = self.store.close_match(id) {
@@ -515,32 +766,139 @@ impl ChessrenaApp {
         ui.columns(2, |cols| {
             cols[0].horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(format!("{} to move. {} legal moves.", if game.side_to_move() == Color::White { "White" } else { "Black" }, game.legal_moves_uci().len())).strong());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} to move. {} legal moves.",
+                            if game.side_to_move() == Color::White {
+                                "White"
+                            } else {
+                                "Black"
+                            },
+                            game.legal_moves_uci().len()
+                        ))
+                        .strong(),
+                    );
                     ui.add_space(8.0);
-                    egui::Frame::group(ui.style()).fill(surface).stroke(egui::Stroke::new(1.0_f32, border)).inner_margin(12.0).show(ui, |ui| Self::show_board(ui, &record.fen, &record.moves, 520.0, true));
+                    egui::Frame::group(ui.style())
+                        .fill(surface)
+                        .stroke(egui::Stroke::new(1.0_f32, border))
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            Self::show_board(ui, &record.fen, &record.moves, 520.0, true)
+                        });
                 });
             });
             cols[1].vertical(|ui| {
-                egui::Frame::group(ui.style()).fill(surface).stroke(egui::Stroke::new(1.0_f32, border)).inner_margin(14.0).show(ui, |ui| {
-                    ui.label(egui::RichText::new("AGENTS").small().strong().color(egui::Color32::GRAY));
-                    ui.add_space(11.0);
-                    ui.label(format!("White  {}", record.white_name));
-                    ui.separator();
-                    ui.label(format!("Black  {}", record.black_name));
-                    ui.add_space(14.0);
-                    ui.label(egui::RichText::new("Agent registration and live match controls are the next implementation step.").small().color(egui::Color32::GRAY));
-                });
+                egui::Frame::group(ui.style())
+                    .fill(surface)
+                    .stroke(egui::Stroke::new(1.0_f32, border))
+                    .inner_margin(14.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("AGENTS")
+                                .small()
+                                .strong()
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.add_space(8.0);
+                        for seat_number in 1..=2 {
+                            let seat = seats.iter().find(|item| item.seat == seat_number);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("Agent {seat_number}")).strong(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let status = match seat {
+                                            Some(item) if item.ready => "Ready",
+                                            Some(item) if item.registered => "Registered",
+                                            _ => "Waiting",
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(status)
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    },
+                                );
+                            });
+                            if let Some(name) = seat.and_then(|item| item.name.as_deref()) {
+                                ui.label(
+                                    egui::RichText::new(name).small().color(egui::Color32::GRAY),
+                                );
+                            }
+                            let token = self.invites.get(&id).map(|pair| {
+                                if seat_number == 1 {
+                                    pair.0.clone()
+                                } else {
+                                    pair.1.clone()
+                                }
+                            });
+                            if let Some(token) = token {
+                                if ui
+                                    .button(format!("Copy prompt for Agent {seat_number}"))
+                                    .clicked()
+                                {
+                                    let prompt = agent_prompt(id, seat_number, &token);
+                                    ui.ctx().copy_text(prompt);
+                                }
+                            }
+                            if seat_number == 1 {
+                                ui.separator();
+                            }
+                        }
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "API is local only until the temporary tunnel phase is connected.",
+                            )
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                    });
                 ui.add_space(12.0);
-                egui::Frame::group(ui.style()).fill(surface).stroke(egui::Stroke::new(1.0_f32, border)).inner_margin(14.0).show(ui, |ui| {
-                    ui.label(egui::RichText::new("MOVE HISTORY").small().strong().color(egui::Color32::GRAY));
-                    ui.add_space(8.0);
-                    let history = game.san_history();
-                    ui.label(if history.is_empty() { "No moves yet".to_owned() } else { history });
-                });
+                egui::Frame::group(ui.style())
+                    .fill(surface)
+                    .stroke(egui::Stroke::new(1.0_f32, border))
+                    .inner_margin(14.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("MOVE HISTORY")
+                                .small()
+                                .strong()
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.add_space(8.0);
+                        let history = game.san_history();
+                        ui.label(if history.is_empty() {
+                            "No moves yet".to_owned()
+                        } else {
+                            history
+                        });
+                    });
                 ui.add_space(12.0);
                 if record.status == "Paused" || record.status == "Waiting" {
-                    ui.add_enabled(false, egui::Button::new("Start match").fill(accent));
-                    ui.label(egui::RichText::new("Start will be enabled after both agents are ready.").small().color(egui::Color32::GRAY));
+                    let label = if record.status == "Paused" {
+                        "Resume match"
+                    } else {
+                        "Start match"
+                    };
+                    if ui
+                        .add_enabled(both_ready, egui::Button::new(label).fill(accent))
+                        .clicked()
+                    {
+                        if let Err(error) = self.store.start_match(id) {
+                            self.error = Some(error);
+                        }
+                    }
+                    if !both_ready {
+                        ui.label(
+                            egui::RichText::new("Both agents must register and mark ready.")
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
                 }
             });
         });
@@ -608,6 +966,25 @@ impl ChessrenaApp {
     }
 }
 
+fn agent_prompt(match_id: i64, seat: u8, token: &str) -> String {
+    format!("You are one of two agents playing a Chessrena match. Use the official Python helper at https://github.com/goldggs/Chessrena/blob/main/agent/chessrena_agent.py. Save it in your persistent workspace and inspect the source before running it.\n\nRegister your distinct display name with:\npython3 chessrena_agent.py register --url http://127.0.0.1:18764 --match {match_id} --invite {token} --name YOUR_NAME\n\nThen run:\npython3 chessrena_agent.py ready --match {match_id}\npython3 chessrena_agent.py wait --match {match_id}\npython3 chessrena_agent.py move --match {match_id} UCI_MOVE\n\nOnly submit a move listed in the latest legalMoves data, and only when nextAction is move. The local API is not yet exposed through the temporary tunnel. Replace the local URL with the live tunnel address before using this prompt from a remote Arena agent. Your seat is Agent {seat}.")
+}
+
+fn random_invite_token() -> rusqlite::Result<String> {
+    let mut bytes = [0_u8; 32];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn hash_token(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn data_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
@@ -624,6 +1001,10 @@ fn data_dir() -> Result<PathBuf, String> {
         let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
         Ok(PathBuf::from(home).join(".local/share/chessrena"))
     }
+}
+
+fn normalize_name(name: &str) -> String {
+    name.trim().to_lowercase()
 }
 
 fn now() -> i64 {
@@ -696,6 +1077,15 @@ mod tests {
     }
 
     #[test]
+    fn match_name_uniqueness_handles_unicode_case() {
+        let store = memory_store();
+        let first = store.create().unwrap();
+        let second = store.create().unwrap();
+        store.rename(first, "Ägents").unwrap();
+        assert!(store.rename(second, "ägents").is_err());
+    }
+
+    #[test]
     fn closing_a_running_match_saves_it_as_paused() {
         let store = memory_store();
         let id = store.create().unwrap();
@@ -716,6 +1106,93 @@ mod tests {
         assert_eq!(store.get(id).unwrap().unwrap().moves, "e2e4");
         assert!(store.play_uci(id, "e2e3").is_err());
         assert_eq!(store.get(id).unwrap().unwrap().moves, "e2e4");
+    }
+
+    #[test]
+    fn agents_register_uniquely_and_must_both_be_ready_to_start() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        store
+            .register_agent(created.id, &created.first_invite, "North")
+            .unwrap();
+        assert!(store
+            .register_agent(created.id, &created.second_invite, " north ")
+            .is_err());
+        store
+            .register_agent(created.id, &created.second_invite, "South")
+            .unwrap();
+        store
+            .mark_agent_ready(created.id, &created.first_invite)
+            .unwrap();
+        assert!(store.start_match(created.id).is_err());
+        store
+            .mark_agent_ready(created.id, &created.second_invite)
+            .unwrap();
+        store.start_match(created.id).unwrap();
+        let seats = store.seats(created.id).unwrap();
+        assert_eq!(seats.len(), 2);
+        assert!(seats.iter().all(|seat| seat.color.is_some()));
+        assert_ne!(seats[0].color, seats[1].color);
+        assert_eq!(
+            store.get(created.id).unwrap().unwrap().status,
+            "In progress"
+        );
+        let assigned_colors: Vec<_> = seats.iter().map(|seat| seat.color.clone()).collect();
+        store.close_match(created.id).unwrap();
+        assert!(store
+            .seats(created.id)
+            .unwrap()
+            .iter()
+            .all(|seat| !seat.registered && !seat.ready));
+        store
+            .register_agent(created.id, &created.first_invite, "North")
+            .unwrap();
+        store
+            .register_agent(created.id, &created.second_invite, "South")
+            .unwrap();
+        store
+            .mark_agent_ready(created.id, &created.first_invite)
+            .unwrap();
+        store
+            .mark_agent_ready(created.id, &created.second_invite)
+            .unwrap();
+        store.start_match(created.id).unwrap();
+        let resumed_colors: Vec<_> = store
+            .seats(created.id)
+            .unwrap()
+            .iter()
+            .map(|seat| seat.color.clone())
+            .collect();
+        assert_eq!(assigned_colors, resumed_colors);
+    }
+
+    #[test]
+    fn invitation_tokens_are_hashed_at_rest() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        let stored_hash: String = store
+            .db
+            .query_row(
+                "SELECT token_hash FROM agent_seats WHERE match_id = ?1 AND seat = 1",
+                [created.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_hash.len(), 64);
+        assert_ne!(stored_hash, created.first_invite);
+    }
+
+    #[test]
+    fn invitation_rotation_revokes_the_previous_token() {
+        let store = memory_store();
+        let created = store.create_with_invites().unwrap();
+        let old_token = created.first_invite;
+        let (new_token, _) = store.rotate_invites(created.id).unwrap();
+        assert!(store.seat_for_token(created.id, &old_token).is_err());
+        assert_eq!(
+            store.seat_for_token(created.id, &new_token).unwrap().seat,
+            1
+        );
     }
 
     #[test]
