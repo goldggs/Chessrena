@@ -308,40 +308,45 @@ fn make_router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-pub(crate) fn spawn(database_path: PathBuf) {
+pub(crate) fn spawn(database_path: PathBuf) -> Result<(), String> {
+    let store = Store::open(database_path)
+        .map_err(|error| format!("Chessrena API could not open match database: {error}"))?;
+    let listener = std::net::TcpListener::bind(ADDRESS)
+        .map_err(|error| format!("Chessrena API could not bind {ADDRESS}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("Could not configure the local API listener: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Chessrena API runtime error: {error}"))?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("chessrena-api".to_owned())
         .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build();
-            match runtime {
-                Ok(runtime) => runtime.block_on(async move {
-                    let store = match Store::open(database_path) {
-                        Ok(store) => store,
-                        Err(error) => {
-                            eprintln!("Chessrena API database error: {error}");
-                            return;
-                        }
-                    };
-                    let app = make_router(ApiState {
-                        store: Arc::new(Mutex::new(store)),
-                    });
-                    let listener = match TcpListener::bind(ADDRESS).await {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            eprintln!("Chessrena API could not bind {ADDRESS}: {error}");
-                            return;
-                        }
-                    };
-                    if let Err(error) = axum::serve(listener, app).await {
-                        eprintln!("Chessrena API stopped: {error}");
+            runtime.block_on(async move {
+                let app = make_router(ApiState {
+                    store: Arc::new(Mutex::new(store)),
+                });
+                let listener = match TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                        eprintln!("Chessrena API could not initialize listener: {error}");
+                        return;
                     }
-                }),
-                Err(error) => eprintln!("Chessrena API runtime error: {error}"),
-            }
+                };
+                let _ = ready_tx.send(Ok(()));
+                if let Err(error) = axum::serve(listener, app).await {
+                    eprintln!("Chessrena API stopped: {error}");
+                }
+            });
         })
-        .expect("API thread should start");
+        .map_err(|error| format!("Could not start the Chessrena API thread: {error}"))?;
+    ready_rx
+        .recv()
+        .map_err(|error| format!("Chessrena API failed to initialize: {error}"))?
+        .map_err(|error| format!("Chessrena API could not initialize listener: {error}"))
 }
 
 #[cfg(test)]

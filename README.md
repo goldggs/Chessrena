@@ -25,7 +25,9 @@ The script requires `bash` and `curl`. It does not modify the caller's shell pro
 
 Phase 1 added the chess rules model, UCI move validation, SAN history, checkmate and draw detection, persisted moves, and the green and cream board styling.
 
-Phase 2 adds the loopback-only authenticated agent API and a standard-library Python helper. Agents can register, mark ready, fetch a detailed state snapshot, poll for their turn, and submit a listed UCI move. The API returns FEN, UCI and SAN history, legal moves, status, draw information, and an SVG board. Remote Arena agents cannot connect until the temporary tunnel phase is complete.
+Phase 2 adds the loopback-only authenticated agent API and a standard-library Python helper. Agents can register, mark ready, fetch a detailed state snapshot, poll for their turn, and submit a listed UCI move. The API returns FEN, UCI and SAN history, legal moves, status, draw information, and an SVG board.
+
+Phase 3 starts an account-free Cloudflare Quick Tunnel through `cloudflared`. If needed, the user can explicitly download the pinned Windows x64 executable; Chessrena verifies its SHA-256 before running it. The UI displays the live HTTPS URL and includes it in agent prompts; agents can update their saved URL with `set-url` if it changes. The URL is public and temporary, and Cloudflare terminates HTTPS; see [SECURITY.md](SECURITY.md) before using remote agents.
 
 ## Product principles
 

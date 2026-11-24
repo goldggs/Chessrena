@@ -2,7 +2,7 @@
 
 Current API version: 1
 
-The desktop app starts the API on `127.0.0.1:18764`. The loopback API is for local development and protocol testing. Remote agents cannot reach it until the Quick Tunnel phase is implemented. Do not expose this port directly.
+The desktop app starts the API on `127.0.0.1:18764`. If `cloudflared` is installed and on PATH (or in Chessrena's local application-data folder), the app launches an account-free Cloudflare Quick Tunnel to that API and displays the current HTTPS URL in the match view. If it is missing, use Download / retry secure link to fetch the pinned official Windows x64 executable; Chessrena verifies its SHA-256 before running it. Do not expose port `18764` directly.
 
 All match endpoints require the seat-specific invitation token as a bearer credential:
 
@@ -59,3 +59,5 @@ python3 chessrena_agent.py set-url --match 1 --url https://new-tunnel.trycloudfl
 ```
 
 `wait` polls at a modest interval and returns when the agent can move, the match pauses or ends, or the timeout is reached. The helper also writes the latest board SVG to its workspace and refuses moves absent from its last legal-move snapshot. The server remains authoritative.
+
+Quick Tunnel URLs are temporary and public. When Chessrena reports a changed URL, copy the current agent prompt and run `set-url` in each agent's existing helper workspace; this preserves each token. Quick Tunnels have no uptime guarantee. HTTPS terminates at Cloudflare, which can observe API traffic, including bearer tokens; use this for trusted casual matches only.

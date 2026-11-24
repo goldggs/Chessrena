@@ -1,4 +1,5 @@
 mod api;
+mod tunnel;
 
 use chess::{Board, Color, File, Piece, Rank, Square};
 use chessrena::game::{first_seat_gets_white, Game, Outcome, PlayedMove};
@@ -10,6 +11,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     str::FromStr,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -380,6 +382,9 @@ struct ChessrenaApp {
     rename_target: Option<(i64, String)>,
     delete_target: Option<i64>,
     error: Option<String>,
+    tunnel: tunnel::TunnelController,
+    last_tunnel_url: Option<String>,
+    tunnel_url_changed: bool,
 }
 
 impl ChessrenaApp {
@@ -388,7 +393,7 @@ impl ChessrenaApp {
         let store = Store::open(path.clone())
             .map_err(|e| format!("Could not open local match database: {e}"))?;
         store.recover_after_restart().map_err(|e| e.to_string())?;
-        api::spawn(path);
+        api::spawn(path)?;
         Ok(Self {
             store,
             invites: HashMap::new(),
@@ -396,6 +401,9 @@ impl ChessrenaApp {
             rename_target: None,
             delete_target: None,
             error: None,
+            tunnel: tunnel::TunnelController::start(),
+            last_tunnel_url: None,
+            tunnel_url_changed: false,
         })
     }
 
@@ -489,6 +497,18 @@ impl ChessrenaApp {
 
 impl eframe::App for ChessrenaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(Duration::from_secs(1));
+        let tunnel_status = self.tunnel.status();
+        if let Some(url) = tunnel_status.url.as_ref() {
+            if self
+                .last_tunnel_url
+                .as_ref()
+                .is_some_and(|previous| previous != url)
+            {
+                self.tunnel_url_changed = true;
+            }
+            self.last_tunnel_url = Some(url.clone());
+        }
         let bg = egui::Color32::from_rgb(17, 20, 18);
         let surface = egui::Color32::from_rgb(25, 29, 26);
         let border = egui::Color32::from_rgb(52, 59, 54);
@@ -738,6 +758,7 @@ impl ChessrenaApp {
         let game = Game::from_uci_history(&record.moves).unwrap_or_default();
         let seats = self.store.seats(id).unwrap_or_default();
         let both_ready = seats.len() == 2 && seats.iter().all(|seat| seat.registered && seat.ready);
+        let tunnel_status = self.tunnel.status();
         ui.horizontal(|ui| {
             if ui.button("‹  Matches").clicked() {
                 if let Err(e) = self.store.close_match(id) {
@@ -801,6 +822,35 @@ impl ChessrenaApp {
                                 .color(egui::Color32::GRAY),
                         );
                         ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(&tunnel_status.message)
+                                .small()
+                                .color(if tunnel_status.url.is_some() {
+                                    egui::Color32::from_rgb(168, 213, 177)
+                                } else {
+                                    egui::Color32::GRAY
+                                }),
+                        );
+                        if let Some(url) = tunnel_status.url.as_deref() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Public HTTPS link").small());
+                                if ui.small_button("Copy URL").clicked() {
+                                    ui.ctx().copy_text(url.to_owned());
+                                }
+                            });
+                        } else if !tunnel_status.message.starts_with("Starting")
+                            && !tunnel_status.message.starts_with("Retrying")
+                            && !tunnel_status.message.starts_with("Downloading")
+                            && ui.small_button("Download / retry secure link").clicked()
+                        {
+                            self.tunnel.retry();
+                        }
+                        if self.tunnel_url_changed {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(246, 209, 130),
+                                "The tunnel address changed. Re-copy the agent prompts.",
+                            );
+                        }
                         for seat_number in 1..=2 {
                             let seat = seats.iter().find(|item| item.seat == seat_number);
                             ui.horizontal(|ui| {
@@ -835,13 +885,14 @@ impl ChessrenaApp {
                                     pair.1.clone()
                                 }
                             });
-                            if let Some(token) = token {
+                            if let (Some(token), Some(url)) = (token, tunnel_status.url.as_deref()) {
                                 if ui
                                     .button(format!("Copy prompt for Agent {seat_number}"))
                                     .clicked()
                                 {
-                                    let prompt = agent_prompt(id, seat_number, &token);
+                                    let prompt = agent_prompt(id, seat_number, &token, url);
                                     ui.ctx().copy_text(prompt);
+                                    self.tunnel_url_changed = false;
                                 }
                             }
                             if seat_number == 1 {
@@ -850,9 +901,11 @@ impl ChessrenaApp {
                         }
                         ui.add_space(10.0);
                         ui.label(
-                            egui::RichText::new(
-                                "API is local only until the temporary tunnel phase is connected.",
-                            )
+                            egui::RichText::new(if tunnel_status.url.is_some() {
+                                "Anyone with the temporary link can reach the API; invite tokens are still required. Share prompts only with the intended agent."
+                            } else {
+                                "Download / retry fetches the official Cloudflare executable, verifies its SHA-256, then starts a public temporary link. No account is needed."
+                            })
                             .small()
                             .color(egui::Color32::GRAY),
                         );
@@ -966,8 +1019,8 @@ impl ChessrenaApp {
     }
 }
 
-fn agent_prompt(match_id: i64, seat: u8, token: &str) -> String {
-    format!("You are one of two agents playing a Chessrena match. Use the official Python helper at https://github.com/goldggs/Chessrena/blob/main/agent/chessrena_agent.py. Save it in your persistent workspace and inspect the source before running it.\n\nRegister your distinct display name with:\npython3 chessrena_agent.py register --url http://127.0.0.1:18764 --match {match_id} --invite {token} --name YOUR_NAME\n\nThen run:\npython3 chessrena_agent.py ready --match {match_id}\npython3 chessrena_agent.py wait --match {match_id}\npython3 chessrena_agent.py move --match {match_id} UCI_MOVE\n\nOnly submit a move listed in the latest legalMoves data, and only when nextAction is move. The local API is not yet exposed through the temporary tunnel. Replace the local URL with the live tunnel address before using this prompt from a remote Arena agent. Your seat is Agent {seat}.")
+fn agent_prompt(match_id: i64, seat: u8, token: &str, server_url: &str) -> String {
+    format!("You are one of two agents playing a Chessrena match. Use the official Python helper at https://github.com/goldggs/Chessrena/blob/main/agent/chessrena_agent.py. Save it in your persistent workspace and inspect the source before running it.\n\nFirst-time setup: register your distinct display name with:\npython3 chessrena_agent.py register --url {server_url} --match {match_id} --invite {token} --name YOUR_NAME\n\nIf you already registered this seat, update the saved endpoint instead (this preserves your invite token):\npython3 chessrena_agent.py set-url --match {match_id} --url {server_url}\n\nThen, when the match is waiting for agents, run:\npython3 chessrena_agent.py ready --match {match_id}\npython3 chessrena_agent.py wait --match {match_id}\npython3 chessrena_agent.py move --match {match_id} UCI_MOVE\n\nOnly submit a move listed in the latest legalMoves data, and only when nextAction is move. The URL is temporary. If Chessrena reports that it changed, rerun set-url with the new address. Your seat is Agent {seat}.")
 }
 
 fn random_invite_token() -> rusqlite::Result<String> {

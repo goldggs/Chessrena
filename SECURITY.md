@@ -1,26 +1,27 @@
 # Security notes
 
-Chessrena is local-first. The Windows app stores match state in SQLite and runs a small agent API bound to loopback only. Cloudflare Quick Tunnel exposure is not implemented yet.
+Chessrena keeps match state authoritative on the local desktop app. The API listens on loopback (`127.0.0.1:18764`); when `cloudflared` is available, Chessrena starts an account-free Cloudflare Quick Tunnel to that local API. The Quick Tunnel provides a temporary public HTTPS address and is stopped when Chessrena exits.
 
-## Implemented
+## Implemented boundaries
 
-- The API listens only on `127.0.0.1:18764`. It does not bind to all network interfaces.
-- Agent invitations contain 256 bits of operating-system randomness. SQLite stores SHA-256 hashes, not the invitation strings.
-- Agent credentials are sent in the HTTP `Authorization` header, never in the URL.
-- Each match has two separate seats. Registration, readiness, seat assignment, current turn, position version, and legal moves are checked by the application.
-- Move submission is revalidated against the server-side chess position. A client cannot choose its color or override the current turn.
-- The API does not expose a public route to start, pause, end, rename, or delete a match.
-- The agent helper uses only Python's standard library. It refuses non-HTTPS remote URLs and blocks redirects, while allowing HTTP for loopback development.
-- The agent helper stores its token in its own `chessrena_workspace` folder with restrictive file permissions where supported. Do not commit that folder.
+- The API does not bind to a LAN or public interface. Do not expose port `18764` directly.
+- Each match has two separate invitation tokens with 256 bits of OS-generated randomness. SQLite stores SHA-256 hashes, never the raw invitation strings.
+- API endpoints other than the non-sensitive health check require the matching seat's bearer token. Credentials are not placed in URLs.
+- The app checks registration, readiness, assigned seat/color, active-match state, turn, position version, and legal moves. Remote agents cannot start, pause, finish, rename, delete, or assign colors.
+- The Python helper uses only the standard library, blocks redirects, permits HTTPS for remote URLs, and allows plain HTTP only for loopback development. Config writes use a temporary file and restrictive permissions where supported.
+- Chessrena launches `cloudflared` without a shell and terminates its process when the app exits. It accepts only an HTTPS `*.trycloudflare.com` URL from cloudflared output.
 
-## Not implemented yet
+## Exposure and trust
 
-- The temporary Cloudflare Tunnel and remote HTTPS path.
-- Rate limiting and API request quotas.
-- A signed Windows release.
+- A Quick Tunnel URL is public and temporary. Anyone who discovers it can reach the API, but still needs a valid, high-entropy seat token for match operations. Treat both URL and invite prompts as sensitive; distribute prompts only to the intended agents.
+- HTTPS terminates at Cloudflare. Cloudflare is therefore in the network path and can observe API traffic, including bearer credentials. The local origin leg from `cloudflared` to `127.0.0.1` is HTTP on the same machine.
+- Quick Tunnels have no uptime guarantee and their hostname changes when recreated. The UI displays the current URL and warns when it changes; agents must update their saved endpoint using `set-url`.
+- If `cloudflared` is missing, the explicit Download / retry secure link action downloads the official Windows x64 executable from [Cloudflare's GitHub release](https://github.com/cloudflare/cloudflared/releases/tag/2026.8.2) and verifies its SHA-256 before saving it under `%LOCALAPPDATA%\\Chessrena`. Current pin: release `2026.8.2`, SHA-256 `c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5`. The pinned release must be updated deliberately as part of maintenance. No account, domain, or signup-based tunnel is required.
 
-Until the tunnel phase is finished, agents outside the Windows host cannot reach the loopback API. Do not expose port 18764 directly to the network.
+## Remaining risks / review items
 
-## Reporting
+- Per-IP rate limiting, request quotas, abuse controls, and audit logging are not implemented. A high-entropy token prevents guessing but does not mitigate traffic flooding.
+- The Quick Tunnel is a convenience feature, not a production hosting or availability mechanism. Stop Chessrena to revoke its live URL; rotate a seat invitation in the app if its token is exposed.
+- Windows release signing and independent security review remain outstanding.
 
-Please report security issues privately to the repository owner before opening a public issue.
+Until rate limits and operational controls are added, use only for trusted casual matches. Report security issues privately to the repository owner before opening a public issue.
