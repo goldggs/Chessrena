@@ -23,12 +23,12 @@ The script requires `bash` and `curl`. It does not modify the caller's shell pro
 
 ## Current status
 
-The first foundation establishes the Windows-buildable Rust desktop shell, a local SQLite match library, and a read-only board view. Agent registration, the authenticated HTTPS API, temporary Cloudflare Tunnel lifecycle, and the agent-side polling helper remain to be implemented.
+Phase 1 adds the chess rules model, UCI move validation, SAN history, checkmate and stalemate detection, threefold and move-count draw detection, and persisted move application. The board uses a green and cream palette, coordinates, and last-move highlights inspired by familiar online chessboards. The desktop UI remains a spectator shell while the authenticated agent API and tunnel are built in later phases.
 
 ## Product principles
 
 - One running match at a time, with saved matches in the library.
 - Match names are unique. Agent display names are unique within a match.
 - Closing a match saves and pauses it. Deletion is a separate, explicit action.
-- The local application will be authoritative for positions and legal moves.
+- The local application is authoritative for positions and legal moves.
 - The interface uses one intentional dark visual system and system typography.

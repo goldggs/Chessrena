@@ -1,4 +1,5 @@
 use chess::{Board, Color, File, Piece, Rank, Square};
+use chessrena::game::{Game, Outcome, PlayedMove};
 use eframe::egui;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
@@ -129,6 +130,30 @@ impl Store {
         )?;
         Ok(())
     }
+
+    #[allow(dead_code)] // The authenticated agent API will call this in Phase 2.
+    fn play_uci(&self, id: i64, uci: &str) -> Result<PlayedMove, String> {
+        let record = self
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Match not found")?;
+        if record.status != "In progress" {
+            return Err("Only an active match accepts moves".to_owned());
+        }
+        let mut game = Game::from_uci_history(&record.moves).map_err(|e| e.to_string())?;
+        let played = game.play_uci(uci).map_err(|e| e.to_string())?;
+        let status = match game.outcome() {
+            Outcome::Checkmate { .. } | Outcome::Stalemate | Outcome::DrawAutomatic => "Finished",
+            Outcome::Ongoing | Outcome::DrawClaimAvailable => "In progress",
+        };
+        self.db
+            .execute(
+                "UPDATE matches SET fen = ?1, moves = ?2, status = ?3, updated_at = ?4 WHERE id = ?5",
+                params![game.fen(), game.uci_history(), status, now(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(played)
+    }
 }
 
 struct ChessrenaApp {
@@ -153,30 +178,52 @@ impl ChessrenaApp {
         })
     }
 
-    fn show_board(ui: &mut egui::Ui, fen: &str, size: f32) {
-        let Ok(board) = Board::from_str(fen) else {
+    fn show_board(ui: &mut egui::Ui, fen: &str, moves: &str, size: f32, coordinates: bool) {
+        let Ok(position) = Game::from_fen(fen) else {
             ui.colored_label(egui::Color32::LIGHT_RED, "Position data could not be read.");
             return;
         };
-        egui::Grid::new("chessboard")
+        let board = position.board();
+        let last_move = Game::from_uci_history(moves)
+            .ok()
+            .and_then(|game| game.history().last().cloned())
+            .and_then(|played| chess::ChessMove::from_str(&played.uci).ok());
+        let square_size = size / 8.0;
+        egui::Grid::new(ui.next_auto_id())
             .spacing(egui::vec2(0.0, 0.0))
             .show(ui, |ui| {
                 for r in 0..8 {
+                    if coordinates {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(16.0, square_size),
+                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new((8 - r).to_string())
+                                        .size(10.0)
+                                        .color(egui::Color32::from_rgb(156, 169, 151)),
+                                );
+                            },
+                        );
+                    }
                     for f in 0..8 {
                         let square =
                             Square::make_square(Rank::from_index(7 - r), File::from_index(f));
                         let light = (r + f) % 2 == 0;
-                        let color = if light {
-                            egui::Color32::from_rgb(216, 211, 196)
-                        } else {
-                            egui::Color32::from_rgb(99, 118, 106)
+                        let highlighted = last_move
+                            .is_some_and(|m| m.get_source() == square || m.get_dest() == square);
+                        let color = match (light, highlighted) {
+                            (true, false) => egui::Color32::from_rgb(238, 238, 210),
+                            (false, false) => egui::Color32::from_rgb(118, 150, 86),
+                            (true, true) => egui::Color32::from_rgb(246, 246, 105),
+                            (false, true) => egui::Color32::from_rgb(186, 202, 43),
                         };
                         let piece = board
                             .piece_on(square)
                             .map(|p| piece_glyph(p, board.color_on(square).unwrap_or(Color::White)))
                             .unwrap_or(' ');
                         let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(size / 8.0, size / 8.0),
+                            egui::vec2(square_size, square_size),
                             egui::Sense::hover(),
                         );
                         ui.painter().rect_filled(rect, 0.0, color);
@@ -190,10 +237,28 @@ impl ChessrenaApp {
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 piece,
-                                egui::FontId::proportional(size / 12.0),
+                                egui::FontId::proportional(square_size * 0.78),
                                 ink,
                             );
                         }
+                    }
+                    ui.end_row();
+                }
+                if coordinates {
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    for f in 0..8 {
+                        let file = char::from(b'a' + f as u8);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(square_size, 16.0),
+                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(file.to_string())
+                                        .size(10.0)
+                                        .color(egui::Color32::from_rgb(156, 169, 151)),
+                                );
+                            },
+                        );
                     }
                     ui.end_row();
                 }
@@ -329,7 +394,7 @@ impl ChessrenaApp {
                                 .show(ui, |ui| {
                                     ui.set_min_width(390.0);
                                     ui.horizontal(|ui| {
-                                        Self::show_board(ui, &m.fen, 90.0);
+                                        Self::show_board(ui, &m.fen, &m.moves, 90.0, false);
                                         ui.add_space(10.0);
                                         ui.vertical(|ui| {
                                             ui.horizontal(|ui| {
@@ -421,6 +486,7 @@ impl ChessrenaApp {
                 return;
             }
         };
+        let game = Game::from_uci_history(&record.moves).unwrap_or_default();
         ui.horizontal(|ui| {
             if ui.button("‹  Matches").clicked() {
                 if let Err(e) = self.store.close_match(id) {
@@ -449,9 +515,9 @@ impl ChessrenaApp {
         ui.columns(2, |cols| {
             cols[0].horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(format!("{} to move", side_to_move(&record.fen))).strong());
+                    ui.label(egui::RichText::new(format!("{} to move. {} legal moves.", if game.side_to_move() == Color::White { "White" } else { "Black" }, game.legal_moves_uci().len())).strong());
                     ui.add_space(8.0);
-                    egui::Frame::group(ui.style()).fill(surface).stroke(egui::Stroke::new(1.0_f32, border)).inner_margin(12.0).show(ui, |ui| Self::show_board(ui, &record.fen, 520.0));
+                    egui::Frame::group(ui.style()).fill(surface).stroke(egui::Stroke::new(1.0_f32, border)).inner_margin(12.0).show(ui, |ui| Self::show_board(ui, &record.fen, &record.moves, 520.0, true));
                 });
             });
             cols[1].vertical(|ui| {
@@ -468,7 +534,8 @@ impl ChessrenaApp {
                 egui::Frame::group(ui.style()).fill(surface).stroke(egui::Stroke::new(1.0_f32, border)).inner_margin(14.0).show(ui, |ui| {
                     ui.label(egui::RichText::new("MOVE HISTORY").small().strong().color(egui::Color32::GRAY));
                     ui.add_space(8.0);
-                    ui.label(if record.moves.is_empty() { "No moves yet".to_owned() } else { record.moves.replace(',', "  ") });
+                    let history = game.san_history();
+                    ui.label(if history.is_empty() { "No moves yet".to_owned() } else { history });
                 });
                 ui.add_space(12.0);
                 if record.status == "Paused" || record.status == "Waiting" {
@@ -565,18 +632,11 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
-fn last_move(moves: &str) -> &str {
-    moves
-        .split(',')
-        .rfind(|x| !x.is_empty())
-        .unwrap_or("No moves")
-}
-fn side_to_move(fen: &str) -> &'static str {
-    if fen.split_whitespace().nth(1) == Some("b") {
-        "Black"
-    } else {
-        "White"
-    }
+fn last_move(moves: &str) -> String {
+    Game::from_uci_history(moves)
+        .ok()
+        .and_then(|game| game.history().last().map(|played| played.san.clone()))
+        .unwrap_or_else(|| "No moves".to_owned())
 }
 fn piece_glyph(piece: Piece, color: Color) -> char {
     match (color, piece) {
@@ -644,6 +704,18 @@ mod tests {
         let saved = store.get(id).unwrap().unwrap();
         assert_eq!(saved.status, "Paused");
         assert_eq!(saved.fen, Board::default().to_string());
+    }
+
+    #[test]
+    fn store_persists_legal_moves_and_rejects_illegal_moves() {
+        let store = memory_store();
+        let id = store.create().unwrap();
+        store.set_status(id, "In progress").unwrap();
+        let played = store.play_uci(id, "e2e4").unwrap();
+        assert_eq!(played.san, "e4");
+        assert_eq!(store.get(id).unwrap().unwrap().moves, "e2e4");
+        assert!(store.play_uci(id, "e2e3").is_err());
+        assert_eq!(store.get(id).unwrap().unwrap().moves, "e2e4");
     }
 
     #[test]
