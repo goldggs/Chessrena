@@ -410,11 +410,12 @@ dependencies = [
 
 [[package]]
 name = "chessrena"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "chess",
  "eframe",
+ "image",
  "rand 0.8.8",
  "rusqlite",
  "serde",

@@ -60,7 +60,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage 'agent'), (Join-Path $stage 'docs') | Out-Null
           Copy-Item 'target/x86_64-pc-windows-msvc/release/chessrena.exe' (Join-Path $out $exeName)
           Copy-Item (Join-Path $out $exeName) (Join-Path $stage 'Chessrena.exe')
-          Copy-Item 'README.md', 'SECURITY.md', 'LICENSE' $stage
+          Copy-Item 'README.md', 'SECURITY.md', 'LICENSE', 'docs/THIRD_PARTY_NOTICES.md', 'docs/CC-BY-4.0.txt' $stage
           Copy-Item 'agent/chessrena_agent.py' (Join-Path $stage 'agent')
           Copy-Item 'docs/agent-api.md' (Join-Path $stage 'docs')
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath (Join-Path $out $zipName) -CompressionLevel Optimal

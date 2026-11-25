@@ -1,11 +1,11 @@
-use crate::{piece_glyph, AgentSeat, ChatMessage, Store};
+use crate::{AgentSeat, ChatMessage, Store};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
-use chess::{Color, File, Rank, Square};
+use chess::{Color, File, Piece, Rank, Square};
 use chessrena::game::{Game, Outcome};
 use serde_json::{json, Value};
 use std::{
@@ -396,6 +396,23 @@ fn state_json(
     })
 }
 
+fn piece_svg_source(piece: Piece, color: Color) -> &'static str {
+    match (color, piece) {
+        (Color::White, Piece::King) => include_str!("../assets/chesspieces/kaneo/wK.svg"),
+        (Color::White, Piece::Queen) => include_str!("../assets/chesspieces/kaneo/wQ.svg"),
+        (Color::White, Piece::Rook) => include_str!("../assets/chesspieces/kaneo/wR.svg"),
+        (Color::White, Piece::Bishop) => include_str!("../assets/chesspieces/kaneo/wB.svg"),
+        (Color::White, Piece::Knight) => include_str!("../assets/chesspieces/kaneo/wN.svg"),
+        (Color::White, Piece::Pawn) => include_str!("../assets/chesspieces/kaneo/wP.svg"),
+        (Color::Black, Piece::King) => include_str!("../assets/chesspieces/kaneo/bK.svg"),
+        (Color::Black, Piece::Queen) => include_str!("../assets/chesspieces/kaneo/bQ.svg"),
+        (Color::Black, Piece::Rook) => include_str!("../assets/chesspieces/kaneo/bR.svg"),
+        (Color::Black, Piece::Bishop) => include_str!("../assets/chesspieces/kaneo/bB.svg"),
+        (Color::Black, Piece::Knight) => include_str!("../assets/chesspieces/kaneo/bN.svg"),
+        (Color::Black, Piece::Pawn) => include_str!("../assets/chesspieces/kaneo/bP.svg"),
+    }
+}
+
 fn board_svg(game: &Game) -> String {
     let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 520 520\" role=\"img\" aria-label=\"Chess board position\"><rect width=\"520\" height=\"520\" fill=\"#111412\"/>");
     for row in 0..8 {
@@ -419,11 +436,14 @@ fn board_svg(game: &Game) -> String {
                 "<rect x=\"{x}\" y=\"{y}\" width=\"60\" height=\"60\" fill=\"{fill}\"/>"
             ));
             if let Some(piece) = game.board().piece_on(square) {
-                let glyph = piece_glyph(piece);
-                let is_white = game.board().color_on(square) == Some(Color::White);
-                let fill = if is_white { "#faf9f2" } else { "#1f2721" };
-                let stroke = if is_white { "#263026" } else { "#1f2721" };
-                svg.push_str(&format!("<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-family=\"Segoe UI Symbol, DejaVu Sans, serif\" font-size=\"48\" fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"1.4\" paint-order=\"stroke fill\" stroke-linejoin=\"round\">{glyph}</text>", x + 30, y + 31));
+                let color = game.board().color_on(square).unwrap_or(Color::White);
+                let piece_svg = piece_svg_source(piece, color);
+                let inner = piece_svg
+                    .find('>')
+                    .and_then(|start| piece_svg.get(start + 1..))
+                    .and_then(|content| content.rfind("</svg>").map(|end| &content[..end]))
+                    .unwrap_or_default();
+                svg.push_str(&format!("<svg x=\"{x}\" y=\"{y}\" width=\"60\" height=\"60\" viewBox=\"0 0 50 50\" preserveAspectRatio=\"xMidYMid meet\" fill-rule=\"evenodd\" clip-rule=\"evenodd\">{inner}</svg>"));
             }
         }
         svg.push_str(&format!("<text x=\"10\" y=\"{}\" font-family=\"system-ui, sans-serif\" font-size=\"11\" fill=\"#a1aaa3\" text-anchor=\"middle\" dominant-baseline=\"central\">{}</text>", 54 + row * 60, 8 - row));
@@ -683,6 +703,15 @@ mod tests {
         let (second_resign, _) =
             call(&app, "POST", &resign_path, Some(&black_token), Some("{}")).await;
         assert_eq!(second_resign, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn bundled_kaneo_vectors_are_available_for_both_colors() {
+        let white_pawn = piece_svg_source(Piece::Pawn, Color::White);
+        let black_king = piece_svg_source(Piece::King, Color::Black);
+        assert!(white_pawn.contains("viewBox=\"0 0 50 50\""));
+        assert!(white_pawn.contains("#f9f9f9"));
+        assert!(black_king.contains("viewBox=\"0 0 50 50\""));
     }
 
     #[tokio::test]

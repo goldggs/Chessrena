@@ -59,6 +59,20 @@ pub(crate) struct CreatedMatch {
 
 const MAX_CHAT_CHARS: usize = 500;
 const MAX_CHAT_MESSAGES: i64 = 1000;
+const PIECE_PNGS: [&[u8]; 12] = [
+    include_bytes!("../assets/chesspieces/kaneo/wK.png"),
+    include_bytes!("../assets/chesspieces/kaneo/wQ.png"),
+    include_bytes!("../assets/chesspieces/kaneo/wR.png"),
+    include_bytes!("../assets/chesspieces/kaneo/wB.png"),
+    include_bytes!("../assets/chesspieces/kaneo/wN.png"),
+    include_bytes!("../assets/chesspieces/kaneo/wP.png"),
+    include_bytes!("../assets/chesspieces/kaneo/bK.png"),
+    include_bytes!("../assets/chesspieces/kaneo/bQ.png"),
+    include_bytes!("../assets/chesspieces/kaneo/bR.png"),
+    include_bytes!("../assets/chesspieces/kaneo/bB.png"),
+    include_bytes!("../assets/chesspieces/kaneo/bN.png"),
+    include_bytes!("../assets/chesspieces/kaneo/bP.png"),
+];
 
 pub(crate) struct Store {
     db: Connection,
@@ -718,11 +732,13 @@ struct ChessrenaApp {
     rename_target: Option<(i64, String)>,
     delete_target: Option<i64>,
     end_target: Option<i64>,
+    credits_open: bool,
     error: Option<String>,
     tunnel: tunnel::TunnelController,
     last_tunnel_url: Option<String>,
     tunnel_url_changed: bool,
     logo: Option<egui::TextureHandle>,
+    piece_textures: Option<[egui::TextureHandle; 12]>,
 }
 
 impl ChessrenaApp {
@@ -739,15 +755,24 @@ impl ChessrenaApp {
             rename_target: None,
             delete_target: None,
             end_target: None,
+            credits_open: false,
             error: None,
             tunnel: tunnel::TunnelController::start(),
             last_tunnel_url: None,
             tunnel_url_changed: false,
             logo: None,
+            piece_textures: None,
         })
     }
 
-    fn show_board(ui: &mut egui::Ui, fen: &str, moves: &str, size: f32, coordinates: bool) {
+    fn show_board(
+        ui: &mut egui::Ui,
+        fen: &str,
+        moves: &str,
+        size: f32,
+        coordinates: bool,
+        piece_textures: &[egui::TextureHandle; 12],
+    ) {
         let Ok(position) = Game::from_fen(fen) else {
             ui.colored_label(egui::Color32::LIGHT_RED, "Position data could not be read.");
             return;
@@ -787,44 +812,20 @@ impl ChessrenaApp {
                             (true, true) => egui::Color32::from_rgb(246, 246, 105),
                             (false, true) => egui::Color32::from_rgb(186, 202, 43),
                         };
-                        let piece = board.piece_on(square).map(piece_glyph).unwrap_or(' ');
+                        let piece = board.piece_on(square);
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(square_size, square_size),
                             egui::Sense::hover(),
                         );
                         ui.painter().rect_filled(rect, 0.0, color);
-                        if piece != ' ' {
-                            let ink = if board.color_on(square) == Some(Color::White) {
-                                egui::Color32::from_rgb(250, 249, 242)
-                            } else {
-                                egui::Color32::from_rgb(31, 39, 33)
-                            };
-                            let font = egui::FontId::proportional(square_size * 0.78);
-                            let outline = egui::Color32::from_rgb(30, 38, 31);
-                            for offset in [
-                                egui::vec2(-1.2, 0.0),
-                                egui::vec2(1.2, 0.0),
-                                egui::vec2(0.0, -1.2),
-                                egui::vec2(0.0, 1.2),
-                                egui::vec2(-0.8, -0.8),
-                                egui::vec2(0.8, -0.8),
-                                egui::vec2(-0.8, 0.8),
-                                egui::vec2(0.8, 0.8),
-                            ] {
-                                ui.painter().text(
-                                    rect.center() + offset,
-                                    egui::Align2::CENTER_CENTER,
-                                    piece,
-                                    font.clone(),
-                                    outline,
-                                );
-                            }
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                piece,
-                                font,
-                                ink,
+                        if let Some(piece) = piece {
+                            let side = board.color_on(square).unwrap_or(Color::White);
+                            let texture = &piece_textures[piece_texture_index(piece, side)];
+                            ui.painter().image(
+                                texture.id(),
+                                rect,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
                             );
                         }
                     }
@@ -886,6 +887,17 @@ impl eframe::App for ChessrenaApp {
             let pixels = include_bytes!("../assets/chessrena-square.rgba");
             let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], pixels);
             self.logo = Some(ctx.load_texture("chessrena-square-logo", image, Default::default()));
+        }
+        if self.piece_textures.is_none() {
+            let textures = std::array::from_fn(|index| {
+                let decoded = image::load_from_memory(PIECE_PNGS[index])
+                    .expect("bundled chess piece PNG must decode")
+                    .to_rgba8();
+                let size = [decoded.width() as usize, decoded.height() as usize];
+                let pixels = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+                ctx.load_texture(format!("kaneo-piece-{index}"), pixels, Default::default())
+            });
+            self.piece_textures = Some(textures);
         }
 
         egui::TopBottomPanel::top("topbar")
@@ -958,6 +970,10 @@ impl ChessrenaApp {
         surface: egui::Color32,
         border: egui::Color32,
     ) {
+        let piece_textures = self
+            .piece_textures
+            .clone()
+            .expect("piece textures are initialized before rendering");
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.heading("Matches");
@@ -1022,7 +1038,14 @@ impl ChessrenaApp {
                                 ui.set_min_width(content_width);
                                 ui.set_min_height(board_size + 4.0);
                                 ui.horizontal(|ui| {
-                                    Self::show_board(ui, &m.fen, &m.moves, board_size, false);
+                                    Self::show_board(
+                                        ui,
+                                        &m.fen,
+                                        &m.moves,
+                                        board_size,
+                                        false,
+                                        &piece_textures,
+                                    );
                                     ui.add_space(12.0);
                                     ui.vertical(|ui| {
                                         ui.set_min_width(
@@ -1048,6 +1071,10 @@ impl ChessrenaApp {
                                                 if ui.button("Rename").clicked() {
                                                     self.rename_target =
                                                         Some((m.id, m.name.clone()));
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Artwork credits").clicked() {
+                                                    self.credits_open = true;
                                                     ui.close_menu();
                                                 }
                                                 if ui.button("Delete match").clicked() {
@@ -1125,6 +1152,10 @@ impl ChessrenaApp {
             && ["Waiting", "In progress", "Paused", "Finished"].contains(&record.status.as_str());
         let chat_messages = self.store.chat_messages(id).unwrap_or_default();
         let tunnel_status = self.tunnel.status();
+        let piece_textures = self
+            .piece_textures
+            .clone()
+            .expect("piece textures are initialized before rendering");
         ui.horizontal(|ui| {
             if ui.button("Back to matches").clicked() {
                 if let Err(e) = self.store.close_match(id) {
@@ -1141,11 +1172,36 @@ impl ChessrenaApp {
                         self.end_target = Some(id);
                         ui.close_menu();
                     }
+                    if ui.button("Artwork credits").clicked() {
+                        self.credits_open = true;
+                        ui.close_menu();
+                    }
                     if ui.button("Delete match").clicked() {
                         self.delete_target = Some(id);
                         ui.close_menu();
                     }
                 });
+                if record.status == "In progress" {
+                    if ui.button("Pause match").clicked() {
+                        if let Err(error) = self.store.pause_match(id) {
+                            self.error = Some(error);
+                        }
+                    }
+                } else if record.status == "Paused" || record.status == "Waiting" {
+                    let label = if record.status == "Paused" {
+                        "Resume match"
+                    } else {
+                        "Start match"
+                    };
+                    if ui
+                        .add_enabled(both_ready, egui::Button::new(label).fill(accent))
+                        .clicked()
+                    {
+                        if let Err(error) = self.store.start_match(id) {
+                            self.error = Some(error);
+                        }
+                    }
+                }
             });
         });
         ui.add_space(16.0);
@@ -1168,7 +1224,7 @@ impl ChessrenaApp {
                         .stroke(egui::Stroke::new(1.0_f32, border))
                         .inner_margin(12.0)
                         .show(ui, |ui| {
-                            Self::show_board(ui, &record.fen, &record.moves, 520.0, true)
+                            Self::show_board(ui, &record.fen, &record.moves, 520.0, true, &piece_textures)
                         });
                 });
             });
@@ -1323,35 +1379,6 @@ impl ChessrenaApp {
                             history
                         });
                     });
-                ui.add_space(12.0);
-                if record.status == "In progress" {
-                    if ui.button("Pause match").clicked() {
-                        if let Err(error) = self.store.pause_match(id) {
-                            self.error = Some(error);
-                        }
-                    }
-                } else if record.status == "Paused" || record.status == "Waiting" {
-                    let label = if record.status == "Paused" {
-                        "Resume match"
-                    } else {
-                        "Start match"
-                    };
-                    if ui
-                        .add_enabled(both_ready, egui::Button::new(label).fill(accent))
-                        .clicked()
-                    {
-                        if let Err(error) = self.store.start_match(id) {
-                            self.error = Some(error);
-                        }
-                    }
-                    if !both_ready {
-                        ui.label(
-                            egui::RichText::new("Both agents must register and mark ready.")
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-                }
             });
         });
     }
@@ -1446,6 +1473,25 @@ impl ChessrenaApp {
                 }
             }
         }
+        if self.credits_open {
+            egui::Window::new("Artwork credits")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut self.credits_open)
+                .show(ctx, |ui| {
+                    ui.label("Kaneo chess piece set by Kadagaden.");
+                    ui.label("Licensed under Creative Commons Attribution 4.0 International (CC BY 4.0).");
+                    ui.hyperlink_to(
+                        "Source repository",
+                        "https://github.com/Kadagaden/chess-pieces",
+                    );
+                    ui.hyperlink_to(
+                        "CC BY 4.0 license",
+                        "https://creativecommons.org/licenses/by/4.0/",
+                    );
+                    ui.label("Piece images are bundled with Chessrena; PNGs are rasterized from the original SVGs.");
+                });
+        }
         let _ = (surface, border);
     }
 }
@@ -1537,17 +1583,16 @@ fn last_move(moves: &str) -> String {
         .and_then(|game| game.history().last().map(|played| played.san.clone()))
         .unwrap_or_else(|| "No moves".to_owned())
 }
-fn piece_glyph(piece: Piece) -> char {
-    // Use the filled chess glyphs for both sides, then tint white-side pieces
-    // with a light fill and a subtle dark outline so they remain legible on cream.
-    match piece {
-        Piece::King => '♚',
-        Piece::Queen => '♛',
-        Piece::Rook => '♜',
-        Piece::Bishop => '♝',
-        Piece::Knight => '♞',
-        Piece::Pawn => '♟',
-    }
+fn piece_texture_index(piece: Piece, color: Color) -> usize {
+    let kind = match piece {
+        Piece::King => 0,
+        Piece::Queen => 1,
+        Piece::Rook => 2,
+        Piece::Bishop => 3,
+        Piece::Knight => 4,
+        Piece::Pawn => 5,
+    };
+    kind + if color == Color::White { 0 } else { 6 }
 }
 
 fn main() -> eframe::Result<()> {
@@ -1884,9 +1929,11 @@ mod tests {
     }
 
     #[test]
-    fn filled_chess_glyphs_are_used_for_both_piece_colors() {
-        assert_eq!(piece_glyph(Piece::Pawn), '♟');
-        assert_eq!(piece_glyph(Piece::King), '♚');
+    fn piece_textures_map_to_a_distinct_color_and_piece_asset() {
+        assert_eq!(piece_texture_index(Piece::King, Color::White), 0);
+        assert_eq!(piece_texture_index(Piece::Pawn, Color::White), 5);
+        assert_eq!(piece_texture_index(Piece::King, Color::Black), 6);
+        assert_eq!(piece_texture_index(Piece::Pawn, Color::Black), 11);
     }
 
     #[test]

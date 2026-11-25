@@ -142,7 +142,14 @@ fn run_tunnel(
             return;
         }
     };
-    let mut child = match Command::new(executable)
+    let mut command = Command::new(executable);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match command
         .args([
             "tunnel",
             "--no-autoupdate",

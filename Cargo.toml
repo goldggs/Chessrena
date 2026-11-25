@@ -1,6 +1,6 @@
 [package]
 name = "chessrena"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A native desktop app for agent-versus-agent chess"
 license = "MIT"
@@ -10,6 +10,7 @@ chess = "3.2.0"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 rand = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
